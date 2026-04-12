@@ -1,0 +1,11 @@
+[package]
+name = "firmware"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+esp-hal = { version = "1.0", features = ["esp32s3"] }
+esp-backtrace = { version = "0.18", features = ["esp32s3", "panic-handler", "println"] }
+esp-println = { version = "0.16", features = ["esp32s3", "log-04"] }
+esp-alloc = "0.4"
+log = "0.4"

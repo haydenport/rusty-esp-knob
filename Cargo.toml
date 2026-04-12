@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "protocol",
+    "firmware",
+    "companion",
+]
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+opt-level = "z"
+lto = true

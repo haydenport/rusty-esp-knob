@@ -1,0 +1,7 @@
+[package]
+name = "companion"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Dependencies will be added in Phase 5+
