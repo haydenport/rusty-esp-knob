@@ -2,7 +2,7 @@
 ///
 /// Reference: Waveshare wiki + BlueKnob community pin maps.
 
-// --- Display (ST77916, QSPI) ---
+// --- Display (SH8601, QSPI AMOLED) ---
 pub const LCD_QSPI_CLK: u8 = 13;
 pub const LCD_QSPI_CS: u8 = 14;
 pub const LCD_QSPI_DATA0: u8 = 15;
