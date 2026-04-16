@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod board;
+mod encoder;
 mod sh8601;
 
 use esp_alloc as _;
@@ -23,6 +24,7 @@ use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{Circle, PrimitiveStyle, Rectangle};
 
+use encoder::Encoder;
 use sh8601::Sh8601;
 
 #[main]
@@ -85,10 +87,21 @@ fn main() -> ! {
         .unwrap();
 
     display.flush().expect("Flush failed");
-    info!("Screen drawn - entering idle loop");
+    info!("Screen drawn");
+
+    // Set up rotary encoder with software debounce (mirrors Waveshare C driver).
+    let mut encoder = Encoder::new(peripherals.GPIO8, peripherals.GPIO7);
+    info!("Encoder ready - turn the knob");
 
     let delay = Delay::new();
+    let mut last_count: i32 = 0;
     loop {
-        delay.delay_millis(1000);
+        encoder.poll();
+        let count = encoder.get();
+        if count != last_count {
+            info!("Encoder: {}", count);
+            last_count = count;
+        }
+        delay.delay_millis(3);
     }
 }

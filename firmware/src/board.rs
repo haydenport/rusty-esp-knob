@@ -20,6 +20,9 @@ pub const TOUCH_SCL: u8 = 12;
 pub const TOUCH_INT: u8 = 9;
 pub const TOUCH_RST: u8 = 10;
 
+// --- Haptic motor (DRV2605, I2C — shares bus with touch) ---
+pub const HAPTIC_I2C_ADDR: u8 = 0x5A;
+
 // --- Rotary encoder ---
 pub const ENCODER_A: u8 = 8;
 pub const ENCODER_B: u8 = 7;
