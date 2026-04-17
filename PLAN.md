@@ -62,12 +62,16 @@ disabled to keep the byte stream clean — route logs elsewhere if needed later.
 
 **Testable outcome**: Send a command from PC, firmware echoes it back.
 
-## Phase 5: PC Companion - Audio Sessions (companion only)
+## Phase 5: PC Companion - Audio Sessions (companion only) - DONE
 
 **Goal**: Enumerate running audio sessions via WASAPI.
 
 - List apps with active audio, get/set per-app volume.
 - Windows-only, uses WASAPI COM APIs.
+
+Files:
+- `companion/src/audio.rs` -- WASAPI enumeration, `set_volume`, `set_mute`.
+- `companion/src/main.rs` -- `companion list` subcommand (+ Phase 4 `serial-test`).
 
 **Testable outcome**: CLI prints list of apps and their current volumes.
 
