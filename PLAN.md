@@ -29,7 +29,7 @@ Note: Display uses SH8601 AMOLED controller (not ST77916 as originally assumed).
 QSPI protocol: opcode 0x02 for register writes, 0x32 for pixel data (quad-wire).
 Framebuffer lives in internal SRAM (270KB heap) -- PSRAM DMA issues unresolved.
 
-## Phase 3: Touch + Encoder + Haptic Input (firmware only) - IN PROGRESS
+## Phase 3: Touch + Encoder + Haptic Input (firmware only) - DONE
 
 **Goal**: Read all hardware inputs and display feedback.
 

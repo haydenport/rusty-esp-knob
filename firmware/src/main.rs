@@ -5,7 +5,9 @@ extern crate alloc;
 
 mod board;
 mod encoder;
+mod haptic;
 mod sh8601;
+mod touch;
 
 use esp_alloc as _;
 use esp_backtrace as _;
@@ -14,6 +16,7 @@ use esp_hal::delay::Delay;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
 use esp_hal::dma_buffers;
 use esp_hal::gpio::{Level, Output, OutputConfig};
+use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::main;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode;
@@ -22,10 +25,77 @@ use log::info;
 
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{Circle, PrimitiveStyle, Rectangle};
+use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
+use u8g2_fonts::FontRenderer;
+use u8g2_fonts::fonts::{u8g2_font_logisoso62_tn, u8g2_font_helvR24_tr};
+use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 
 use encoder::Encoder;
+use haptic::{Drv2605, Effect};
 use sh8601::Sh8601;
+use touch::Cst816;
+
+/// Draw the encoder count in the center of the screen.
+fn draw_count(display: &mut Sh8601, count: i32) {
+    use core::fmt::Write;
+    Rectangle::new(Point::new(30, 110), Size::new(300, 130))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+        .draw(display)
+        .unwrap();
+
+    let mut buf = heapless::String::<16>::new();
+    let _ = write!(buf, "{}", count);
+
+    let font = FontRenderer::new::<u8g2_font_logisoso62_tn>();
+    font.render_aligned(
+        &*buf,
+        Point::new(180, 180),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(Rgb565::WHITE),
+        display,
+    ).unwrap();
+}
+
+/// Draw the page index at the bottom of the screen.
+fn draw_page(display: &mut Sh8601, page: i32) {
+    use core::fmt::Write;
+    Rectangle::new(Point::new(80, 290), Size::new(200, 40))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+        .draw(display)
+        .unwrap();
+
+    let mut buf = heapless::String::<24>::new();
+    let _ = write!(buf, "Page {}", page);
+
+    let font = FontRenderer::new::<u8g2_font_helvR24_tr>();
+    font.render_aligned(
+        &*buf,
+        Point::new(180, 320),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(Rgb565::CSS_GRAY),
+        display,
+    ).unwrap();
+}
+
+/// Draw a status label at the top of the screen (e.g. "TAP", "LONG PRESS").
+fn draw_status(display: &mut Sh8601, text: &str) {
+    Rectangle::new(Point::new(80, 30), Size::new(200, 40))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+        .draw(display)
+        .unwrap();
+
+    let font = FontRenderer::new::<u8g2_font_helvR24_tr>();
+    font.render_aligned(
+        text,
+        Point::new(180, 60),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(Rgb565::GREEN),
+        display,
+    ).unwrap();
+}
 
 #[main]
 fn main() -> ! {
@@ -70,22 +140,10 @@ fn main() -> ! {
     display.init().expect("Display init failed");
     info!("Display initialized");
 
-    // Draw to framebuffer, then flush to display
-    info!("Drawing test pattern...");
-    display.clear(Rgb565::RED).unwrap();
-
-    // White rectangle in the center
-    Rectangle::new(Point::new(80, 80), Size::new(200, 200))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE))
-        .draw(&mut display)
-        .unwrap();
-
-    // Blue circle on top
-    Circle::new(Point::new(130, 130), 100)
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
-        .draw(&mut display)
-        .unwrap();
-
+    // Draw initial screen
+    display.clear(Rgb565::BLACK).unwrap();
+    draw_count(&mut display, 0);
+    draw_page(&mut display, 0);
     display.flush().expect("Flush failed");
     info!("Screen drawn");
 
@@ -93,15 +151,72 @@ fn main() -> ! {
     let mut encoder = Encoder::new(peripherals.GPIO8, peripherals.GPIO7);
     info!("Encoder ready - turn the knob");
 
+    // Set up I2C bus shared by touch (CST816) and haptic (DRV2605)
+    let i2c_config = I2cConfig::default().with_frequency(Rate::from_khz(400));
+    let mut i2c = I2c::new(peripherals.I2C0, i2c_config)
+        .expect("I2C init failed")
+        .with_sda(peripherals.GPIO11)
+        .with_scl(peripherals.GPIO12);
+
+    let mut touch = Cst816::new(&mut i2c, peripherals.GPIO9, peripherals.GPIO10);
+    info!("Touch ready");
+
+    let haptic = Drv2605::init(&mut i2c);
+    info!("Haptic ready");
+
     let delay = Delay::new();
     let mut last_count: i32 = 0;
+    let mut page: i32 = 0;
+    let mut needs_flush = false;
     loop {
         encoder.poll();
         let count = encoder.get();
         if count != last_count {
             info!("Encoder: {}", count);
+            haptic.play(&mut i2c, Effect::SharpClick);
+            draw_count(&mut display, count);
             last_count = count;
+            needs_flush = true;
         }
+
+        if let Some(event) = touch.read(&mut i2c) {
+            if event.gesture != touch::Gesture::None {
+                info!("Touch: ({}, {}) gesture={:?}", event.x, event.y, event.gesture);
+            }
+            match event.gesture {
+                touch::Gesture::SingleTap => {
+                    haptic.play(&mut i2c, Effect::SharpClick);
+                    draw_status(&mut display, "TAP");
+                    needs_flush = true;
+                }
+                touch::Gesture::LongPress => {
+                    haptic.play(&mut i2c, Effect::StrongClick);
+                    draw_status(&mut display, "LONG PRESS");
+                    needs_flush = true;
+                }
+                touch::Gesture::SwipeLeft => {
+                    page -= 1;
+                    info!("Page: {}", page);
+                    draw_page(&mut display, page);
+                    draw_status(&mut display, "< SWIPE");
+                    needs_flush = true;
+                }
+                touch::Gesture::SwipeRight => {
+                    page += 1;
+                    info!("Page: {}", page);
+                    draw_page(&mut display, page);
+                    draw_status(&mut display, "SWIPE >");
+                    needs_flush = true;
+                }
+                _ => {}
+            }
+        }
+
+        if needs_flush {
+            display.flush().expect("Flush failed");
+            needs_flush = false;
+        }
+
         delay.delay_millis(3);
     }
 }
