@@ -8,6 +8,7 @@ mod encoder;
 mod haptic;
 mod sh8601;
 mod touch;
+mod usb_serial;
 
 use esp_alloc as _;
 use esp_backtrace as _;
@@ -21,7 +22,9 @@ use esp_hal::main;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode;
 use esp_hal::time::Rate;
+use esp_hal::usb_serial_jtag::UsbSerialJtag;
 use log::info;
+use protocol::messages::{DeviceToHost, GestureKind, HostToDevice, PROTOCOL_VERSION};
 
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
@@ -34,6 +37,20 @@ use encoder::Encoder;
 use haptic::{Drv2605, Effect};
 use sh8601::Sh8601;
 use touch::Cst816;
+use usb_serial::UsbSerial;
+
+/// Convert a firmware touch gesture to the wire protocol enum.
+fn to_wire_gesture(g: touch::Gesture) -> Option<GestureKind> {
+    match g {
+        touch::Gesture::SingleTap => Some(GestureKind::SingleTap),
+        touch::Gesture::LongPress => Some(GestureKind::LongPress),
+        touch::Gesture::SwipeUp => Some(GestureKind::SwipeUp),
+        touch::Gesture::SwipeDown => Some(GestureKind::SwipeDown),
+        touch::Gesture::SwipeLeft => Some(GestureKind::SwipeLeft),
+        touch::Gesture::SwipeRight => Some(GestureKind::SwipeRight),
+        touch::Gesture::DoubleTap | touch::Gesture::None => None,
+    }
+}
 
 /// Draw the encoder count in the center of the screen.
 fn draw_count(display: &mut Sh8601, count: i32) {
@@ -99,7 +116,10 @@ fn draw_status(display: &mut Sh8601, text: &str) {
 
 #[main]
 fn main() -> ! {
-    esp_println::logger::init_logger_from_env();
+    // NOTE: esp-println logger is intentionally NOT initialized — it would
+    // write log text to the same USB-Serial-JTAG peripheral that the protocol
+    // codec uses, corrupting frames. Panics still emit a backtrace via
+    // esp-backtrace (and those frames are corrupt on purpose — you want the trace).
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
     // Initialize heap allocator for framebuffer (internal SRAM, 270KB)
@@ -164,6 +184,11 @@ fn main() -> ! {
     let haptic = Drv2605::init(&mut i2c);
     info!("Haptic ready");
 
+    // USB Serial/JTAG for host communication
+    let mut usb = UsbSerial::new(UsbSerialJtag::new(peripherals.USB_DEVICE));
+    let _ = usb.send(&DeviceToHost::Ready { version: PROTOCOL_VERSION });
+    info!("USB serial ready");
+
     let delay = Delay::new();
     let mut last_count: i32 = 0;
     let mut page: i32 = 0;
@@ -175,6 +200,7 @@ fn main() -> ! {
             info!("Encoder: {}", count);
             haptic.play(&mut i2c, Effect::SharpClick);
             draw_count(&mut display, count);
+            let _ = usb.send(&DeviceToHost::EncoderDelta(count - last_count));
             last_count = count;
             needs_flush = true;
         }
@@ -207,6 +233,23 @@ fn main() -> ! {
                     draw_page(&mut display, page);
                     draw_status(&mut display, "SWIPE >");
                     needs_flush = true;
+                }
+                _ => {}
+            }
+            if let Some(kind) = to_wire_gesture(event.gesture) {
+                let _ = usb.send(&DeviceToHost::Gesture(kind));
+            }
+        }
+
+        // Handle incoming host messages (echo loop for Phase 4 testing)
+        while let Some(msg) = usb.poll() {
+            info!("USB RX: {:?}", msg);
+            match msg {
+                HostToDevice::Ping => {
+                    let _ = usb.send(&DeviceToHost::Pong);
+                }
+                HostToDevice::Echo(data) => {
+                    let _ = usb.send(&DeviceToHost::Echo(data));
                 }
                 _ => {}
             }

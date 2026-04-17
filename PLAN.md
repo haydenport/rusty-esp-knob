@@ -47,15 +47,18 @@ Hardware:
 Swiping left/right changes a displayed page index. Tapping displays "TAP" text.
 Haptic feedback fires on encoder detent or tap.
 
-## Phase 4: Protocol Library + USB CDC (firmware + protocol crate)
+## Phase 4: Protocol Library + USB CDC (firmware + protocol crate) - DONE
 
 **Goal**: Bidirectional structured communication over USB.
 
 Files:
 - `protocol/Cargo.toml`, `protocol/src/lib.rs`, `protocol/src/messages.rs`, `protocol/src/codec.rs`
 - `firmware/src/usb_serial.rs`
+- `companion/src/main.rs` -- Phase 4 test harness (Ping/Echo + listen for events).
 
-Framing: COBS encoding, CRC-8 integrity check.
+Framing: postcard serialization + CRC-8 + COBS, 0x00 frame terminator.
+Transport: USB-Serial/JTAG (shared with flasher). `esp-println` logger is
+disabled to keep the byte stream clean — route logs elsewhere if needed later.
 
 **Testable outcome**: Send a command from PC, firmware echoes it back.
 

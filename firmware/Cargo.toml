@@ -14,3 +14,4 @@ embedded-graphics = "0.8"
 esp-bootloader-esp-idf = { version = "0.4", features = ["esp32s3"] }
 heapless = "0.8"
 u8g2-fonts = "0.5"
+protocol = { path = "../protocol" }
