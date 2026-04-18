@@ -84,7 +84,7 @@ Files:
 
 **Testable outcome**: Companion sends app list + icons to firmware, firmware displays them.
 
-## Phase 7: End-to-End Volume Control (integration)
+## Phase 7: End-to-End Volume Control (integration) - DONE
 
 **Goal**: Turn knob -> volume changes on PC for the selected app.
 

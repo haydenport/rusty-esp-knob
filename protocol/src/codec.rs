@@ -113,6 +113,12 @@ impl Decoder {
         }
     }
 
+    /// Discard all buffered bytes. Use after a framing error to guarantee the
+    /// next decoded frame starts from a known-clean state.
+    pub fn reset(&mut self) {
+        self.buf.clear();
+    }
+
     /// Append bytes from the transport. Returns `Err` if the internal buffer
     /// would exceed `max_frame_len` — caller should drop and reset.
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), Error> {

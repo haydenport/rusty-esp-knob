@@ -30,7 +30,7 @@ use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, StrokeAlignment};
 use u8g2_fonts::FontRenderer;
-use u8g2_fonts::fonts::{u8g2_font_logisoso62_tn, u8g2_font_helvR24_tr};
+use u8g2_fonts::fonts::{u8g2_font_helvR24_tr, u8g2_font_logisoso62_tn};
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 
 use alloc::string::String;
@@ -47,12 +47,13 @@ const ICON_SIZE: u32 = 64;
 const ICON_X: i32 = (360 - ICON_SIZE as i32) / 2;
 const ICON_Y: i32 = 40;
 
-/// Redraw the icon + name for the currently-selected app.
+/// Redraw the icon, name, and volume for the currently-selected app.
 fn redraw_app(
     display: &mut Sh8601,
     apps: &[AppInfo],
     selected: Option<u32>,
     icon: &[u8],
+    volume: u8,
 ) {
     draw_app_icon(display, icon);
     let name = selected
@@ -60,6 +61,7 @@ fn redraw_app(
         .map(|a| a.name.as_str())
         .unwrap_or("(no app)");
     draw_app_name(display, name);
+    draw_volume(display, volume);
 }
 
 /// Convert a firmware touch gesture to the wire protocol enum.
@@ -75,26 +77,38 @@ fn to_wire_gesture(g: touch::Gesture) -> Option<GestureKind> {
     }
 }
 
-/// Draw the encoder count in the center of the screen.
-fn draw_count(display: &mut Sh8601, count: i32) {
+/// Draw the current volume percentage in the center of the screen.
+/// Renders the digits with the large logisoso62 font and "%" with helvR24,
+/// since logisoso62_tn is numbers-only and doesn't contain the '%' glyph.
+fn draw_volume(display: &mut Sh8601, volume: u8) {
     use core::fmt::Write;
     Rectangle::new(Point::new(30, 110), Size::new(300, 130))
         .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
         .draw(display)
         .unwrap();
 
-    let mut buf = heapless::String::<16>::new();
-    let _ = write!(buf, "{}", count);
+    let mut num_buf = heapless::String::<4>::new();
+    let _ = write!(num_buf, "{}", volume);
 
-    let font = FontRenderer::new::<u8g2_font_logisoso62_tn>();
-    font.render_aligned(
-        &*buf,
-        Point::new(180, 180),
+    let big = FontRenderer::new::<u8g2_font_logisoso62_tn>();
+    let _ = big.render_aligned(
+        num_buf.as_str(),
+        Point::new(160, 180),
         VerticalPosition::Baseline,
         HorizontalAlignment::Center,
         FontColor::Transparent(Rgb565::WHITE),
         display,
-    ).unwrap();
+    );
+
+    let small = FontRenderer::new::<u8g2_font_helvR24_tr>();
+    let _ = small.render_aligned(
+        "%",
+        Point::new(230, 180),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Left,
+        FontColor::Transparent(Rgb565::CSS_GRAY),
+        display,
+    );
 }
 
 /// Draw the page index at the bottom of the screen.
@@ -275,7 +289,7 @@ fn main() -> ! {
 
     // Draw initial screen
     display.clear(Rgb565::BLACK).unwrap();
-    draw_count(&mut display, 0);
+    draw_volume(&mut display, 0);
     draw_page(&mut display, 0);
     display.flush().expect("Flush failed");
     info!("Screen drawn");
@@ -297,9 +311,13 @@ fn main() -> ! {
     let haptic = Drv2605::init(&mut i2c);
     info!("Haptic ready");
 
-    // USB Serial/JTAG for host communication
+    // USB Serial/JTAG for host communication.
+    // Ready is sent lazily on first received host message so it isn't
+    // transmitted during USB re-enumeration (which happens right after
+    // flashing). Bytes sent before the host CDC driver is ready land in
+    // the FIFO at an unpredictable time and corrupt subsequent Ack frames.
     let mut usb = UsbSerial::new(UsbSerialJtag::new(peripherals.USB_DEVICE));
-    let _ = usb.send(&DeviceToHost::Ready { version: PROTOCOL_VERSION });
+    let mut ready_sent = false;
     info!("USB serial ready");
 
     let delay = Delay::new();
@@ -311,18 +329,19 @@ fn main() -> ! {
     let mut apps: Vec<AppInfo> = Vec::new();
     let mut selected_app: Option<u32> = None;
     let mut current_icon: Vec<u8> = Vec::new();
+    let mut current_volume: u8 = 0;
     let mut loop_tick: u32 = 0;
     loop {
         loop_tick = loop_tick.wrapping_add(1);
         encoder.poll();
         let count = encoder.get();
         if count != last_count {
-            info!("Encoder: {}", count);
+            let delta = (count - last_count).clamp(-127, 127) as i8;
             haptic.play(&mut i2c, Effect::SharpClick);
-            draw_count(&mut display, count);
-            let _ = usb.send(&DeviceToHost::EncoderDelta(count - last_count));
+            if let Some(app_id) = selected_app {
+                let _ = usb.send(&DeviceToHost::VolumeDelta { app_id, delta });
+            }
             last_count = count;
-            needs_flush = true;
         }
 
         if let Some(event) = touch.read(&mut i2c) {
@@ -365,7 +384,10 @@ fn main() -> ! {
         // the companion can flow-control large writes (icon pushes) — the PC
         // waits for the Ack before sending the next message.
         while let Some(msg) = usb.poll() {
-            info!("USB RX: {:?}", msg);
+            if !ready_sent {
+                let _ = usb.send(&DeviceToHost::Ready { version: PROTOCOL_VERSION });
+                ready_sent = true;
+            }
             let mut ack = true;
             match msg {
                 HostToDevice::Ping => {
@@ -381,7 +403,12 @@ fn main() -> ! {
                     if selected_app.is_none() {
                         selected_app = apps.first().map(|a| a.id);
                     }
-                    redraw_app(&mut display, &apps, selected_app, &current_icon);
+                    if let Some(id) = selected_app {
+                        if let Some(app) = apps.iter().find(|a| a.id == id) {
+                            current_volume = app.volume;
+                        }
+                    }
+                    redraw_app(&mut display, &apps, selected_app, &current_icon, current_volume);
                     needs_flush = true;
                 }
                 HostToDevice::SetAppIcon { app_id, pixels } => {
@@ -394,8 +421,18 @@ fn main() -> ! {
                 HostToDevice::SetSelectedApp(id) => {
                     selected_app = Some(id);
                     current_icon.clear();
-                    redraw_app(&mut display, &apps, selected_app, &current_icon);
+                    if let Some(app) = apps.iter().find(|a| a.id == id) {
+                        current_volume = app.volume;
+                    }
+                    redraw_app(&mut display, &apps, selected_app, &current_icon, current_volume);
                     needs_flush = true;
+                }
+                HostToDevice::SetVolume { app_id, level } => {
+                    if selected_app == Some(app_id) {
+                        current_volume = level;
+                        draw_volume(&mut display, current_volume);
+                        needs_flush = true;
+                    }
                 }
                 _ => {}
             }
