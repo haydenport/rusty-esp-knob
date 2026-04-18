@@ -28,16 +28,39 @@ use protocol::messages::{DeviceToHost, GestureKind, HostToDevice, PROTOCOL_VERSI
 
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
+use embedded_graphics::primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, StrokeAlignment};
 use u8g2_fonts::FontRenderer;
 use u8g2_fonts::fonts::{u8g2_font_logisoso62_tn, u8g2_font_helvR24_tr};
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use encoder::Encoder;
 use haptic::{Drv2605, Effect};
+use protocol::messages::AppInfo;
 use sh8601::Sh8601;
 use touch::Cst816;
 use usb_serial::UsbSerial;
+
+const ICON_SIZE: u32 = 64;
+const ICON_X: i32 = (360 - ICON_SIZE as i32) / 2;
+const ICON_Y: i32 = 40;
+
+/// Redraw the icon + name for the currently-selected app.
+fn redraw_app(
+    display: &mut Sh8601,
+    apps: &[AppInfo],
+    selected: Option<u32>,
+    icon: &[u8],
+) {
+    draw_app_icon(display, icon);
+    let name = selected
+        .and_then(|id| apps.iter().find(|a| a.id == id))
+        .map(|a| a.name.as_str())
+        .unwrap_or("(no app)");
+    draw_app_name(display, name);
+}
 
 /// Convert a firmware touch gesture to the wire protocol enum.
 fn to_wire_gesture(g: touch::Gesture) -> Option<GestureKind> {
@@ -96,9 +119,97 @@ fn draw_page(display: &mut Sh8601, page: i32) {
     ).unwrap();
 }
 
-/// Draw a status label at the top of the screen (e.g. "TAP", "LONG PRESS").
+/// Blit a raw RGB565 image (big-endian, width×height pixels) to the display.
+fn draw_icon(display: &mut Sh8601, pixels: &[u8], width: u32, height: u32, origin: Point) {
+    use embedded_graphics::image::{Image, ImageRaw};
+    use embedded_graphics::pixelcolor::raw::BigEndian;
+
+    let raw = ImageRaw::<Rgb565, BigEndian>::new(pixels, width);
+    let _ = Image::new(&raw, origin).draw(display);
+}
+
+/// Clear the icon region and paint the given RGB565 bytes there. If `pixels`
+/// is empty, draw a placeholder rectangle instead.
+fn draw_app_icon(display: &mut Sh8601, pixels: &[u8]) {
+    Rectangle::new(Point::new(ICON_X, ICON_Y), Size::new(ICON_SIZE, ICON_SIZE))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+        .draw(display)
+        .unwrap();
+
+    let expected = (ICON_SIZE * ICON_SIZE * 2) as usize;
+    if pixels.len() == expected {
+        draw_icon(display, pixels, ICON_SIZE, ICON_SIZE, Point::new(ICON_X, ICON_Y));
+    } else {
+        // Placeholder: hollow outline. `StrokeAlignment::Inside` keeps the
+        // 2 px stroke entirely within the rect so the black fill we just
+        // drew covers every pixel the next icon blit will touch — without
+        // this, the outer edge of a centered stroke leaks 1 px outside the
+        // fill and lingers as a ghost box behind the real icon.
+        let style = PrimitiveStyleBuilder::new()
+            .stroke_color(Rgb565::CSS_DIM_GRAY)
+            .stroke_width(2)
+            .stroke_alignment(StrokeAlignment::Inside)
+            .build();
+        Rectangle::new(Point::new(ICON_X, ICON_Y), Size::new(ICON_SIZE, ICON_SIZE))
+            .into_styled(style)
+            .draw(display)
+            .unwrap();
+    }
+}
+
+/// Draw the selected app's name directly below the icon.
+fn draw_app_name(display: &mut Sh8601, name: &str) {
+    Rectangle::new(Point::new(20, ICON_Y + ICON_SIZE as i32 + 10), Size::new(320, 40))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+        .draw(display)
+        .unwrap();
+
+    let font = FontRenderer::new::<u8g2_font_helvR24_tr>();
+    let _ = font.render_aligned(
+        name,
+        Point::new(180, ICON_Y + ICON_SIZE as i32 + 36),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(Rgb565::WHITE),
+        display,
+    );
+}
+
+/// Debug readout of the USB-RX stats at the bottom of the screen. Format:
+/// `t=<tick> b=<bytes> ok=<decoded> er=<errs> of=<overflows>`. The `t` counter
+/// increments every main-loop iteration — if it stops climbing on-screen, the
+/// main loop has hard-locked.
+fn draw_rx_stats(display: &mut Sh8601, stats: usb_serial::RxStats, tick: u32) {
+    use core::fmt::Write;
+    use u8g2_fonts::fonts::u8g2_font_profont15_tr;
+
+    Rectangle::new(Point::new(0, 248), Size::new(360, 22))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+        .draw(display)
+        .unwrap();
+
+    let free = esp_alloc::HEAP.free();
+    let mut buf: heapless::String<96> = heapless::String::new();
+    let _ = write!(
+        buf,
+        "t={} b={} ok={} of={} h={} dr={}",
+        tick, stats.bytes, stats.ok, stats.overflow, free, stats.tx_drop
+    );
+
+    let font = FontRenderer::new::<u8g2_font_profont15_tr>();
+    let _ = font.render_aligned(
+        buf.as_str(),
+        Point::new(180, 264),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(Rgb565::CSS_LIGHT_GRAY),
+        display,
+    );
+}
+
+/// Draw a status label near the top of the screen (e.g. "TAP", "LONG PRESS").
 fn draw_status(display: &mut Sh8601, text: &str) {
-    Rectangle::new(Point::new(80, 30), Size::new(200, 40))
+    Rectangle::new(Point::new(80, 5), Size::new(200, 34))
         .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
         .draw(display)
         .unwrap();
@@ -106,7 +217,7 @@ fn draw_status(display: &mut Sh8601, text: &str) {
     let font = FontRenderer::new::<u8g2_font_helvR24_tr>();
     font.render_aligned(
         text,
-        Point::new(180, 60),
+        Point::new(180, 35),
         VerticalPosition::Baseline,
         HorizontalAlignment::Center,
         FontColor::Transparent(Rgb565::GREEN),
@@ -122,8 +233,10 @@ fn main() -> ! {
     // esp-backtrace (and those frames are corrupt on purpose — you want the trace).
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
-    // Initialize heap allocator for framebuffer (internal SRAM, 270KB)
-    esp_alloc::heap_allocator!(size: 270_000);
+    // Initialize heap allocator for framebuffer + protocol buffers (internal SRAM).
+    // Framebuffer is ~253 KB; the rest covers decoder, icon, and app-list allocations.
+    // ~295 KB is the ceiling before the heap collides with the stack region.
+    esp_alloc::heap_allocator!(size: 290_000);
 
     info!("Volume Knob Controller - firmware starting");
 
@@ -193,7 +306,14 @@ fn main() -> ! {
     let mut last_count: i32 = 0;
     let mut page: i32 = 0;
     let mut needs_flush = false;
+
+    // App-list state pushed by the host via SetAppList / SetSelectedApp.
+    let mut apps: Vec<AppInfo> = Vec::new();
+    let mut selected_app: Option<u32> = None;
+    let mut current_icon: Vec<u8> = Vec::new();
+    let mut loop_tick: u32 = 0;
     loop {
+        loop_tick = loop_tick.wrapping_add(1);
         encoder.poll();
         let count = encoder.get();
         if count != last_count {
@@ -241,21 +361,66 @@ fn main() -> ! {
             }
         }
 
-        // Handle incoming host messages (echo loop for Phase 4 testing)
+        // Handle incoming host messages. Each message gets an `Ack` reply so
+        // the companion can flow-control large writes (icon pushes) — the PC
+        // waits for the Ack before sending the next message.
         while let Some(msg) = usb.poll() {
             info!("USB RX: {:?}", msg);
+            let mut ack = true;
             match msg {
                 HostToDevice::Ping => {
+                    ack = false; // Pong replaces the ack for ping.
                     let _ = usb.send(&DeviceToHost::Pong);
                 }
                 HostToDevice::Echo(data) => {
+                    ack = false; // Echo reply replaces the ack.
                     let _ = usb.send(&DeviceToHost::Echo(data));
+                }
+                HostToDevice::SetAppList(list) => {
+                    apps = list;
+                    if selected_app.is_none() {
+                        selected_app = apps.first().map(|a| a.id);
+                    }
+                    redraw_app(&mut display, &apps, selected_app, &current_icon);
+                    needs_flush = true;
+                }
+                HostToDevice::SetAppIcon { app_id, pixels } => {
+                    if selected_app == Some(app_id) {
+                        current_icon = pixels;
+                        draw_app_icon(&mut display, &current_icon);
+                        needs_flush = true;
+                    }
+                }
+                HostToDevice::SetSelectedApp(id) => {
+                    selected_app = Some(id);
+                    current_icon.clear();
+                    redraw_app(&mut display, &apps, selected_app, &current_icon);
+                    needs_flush = true;
                 }
                 _ => {}
             }
+            // Flush now so the host sees `Ack` only after the display work
+            // for this message is actually done.
+            if needs_flush {
+                display.flush().expect("Flush failed");
+                needs_flush = false;
+            }
+            if ack {
+                let _ = usb.send(&DeviceToHost::Ack);
+            }
+        }
+
+        // Trigger a periodic flush every ~600 ms so the stats line stays live
+        // even when nothing else is changing.
+        if loop_tick % 200 == 0 {
+            needs_flush = true;
         }
 
         if needs_flush {
+            // Always redraw stats right before pushing pixels so `t=`
+            // reflects the current loop tick, not a stale snapshot from the
+            // last heartbeat. The draw itself is cheap (framebuffer only).
+            draw_rx_stats(&mut display, usb.stats(), loop_tick);
             display.flush().expect("Flush failed");
             needs_flush = false;
         }

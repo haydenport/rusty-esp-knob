@@ -127,18 +127,42 @@ impl Decoder {
     /// Try to decode one frame. Returns `Ok(Some(msg))` on success,
     /// `Ok(None)` if no complete frame is buffered yet, or `Err` if the
     /// next frame was corrupt (which is still consumed so decoding can progress).
+    ///
+    /// Decodes COBS **in place** inside `self.buf` — for an 8 KB icon frame
+    /// this saves ~16 KB of transient heap versus draining into a fresh Vec
+    /// and copying to a second COBS output buffer. The firmware has only
+    /// ~18 KB of free heap after the framebuffer, so allocating two 8 KB
+    /// scratch buffers was hitting OOM mid-decode.
     pub fn next_frame<T: DeserializeOwned>(&mut self) -> Result<Option<T>, Error> {
         let Some(end) = self.buf.iter().position(|&b| b == 0x00) else {
             return Ok(None);
         };
 
-        let frame: Vec<u8> = self.buf.drain(..=end).take(end).collect();
-        if frame.is_empty() {
+        // Empty frame (just a lone terminator) — skip it.
+        if end == 0 {
+            self.buf.drain(..=end);
             return Ok(None);
         }
 
-        decode(&frame).map(Some)
+        let result = decode_in_place::<T>(&mut self.buf[..end]);
+        // Consume the frame bytes regardless of outcome so a bad frame does
+        // not wedge the decoder.
+        self.buf.drain(..=end);
+        result.map(Some)
     }
+}
+
+/// COBS-decode `buf` in place, validate the trailing CRC, and postcard-deserialize.
+fn decode_in_place<T: DeserializeOwned>(buf: &mut [u8]) -> Result<T, Error> {
+    let decoded_len = cobs::decode_in_place(buf).map_err(|_| Error::Cobs)?;
+    if decoded_len < 2 {
+        return Err(Error::FrameTooShort);
+    }
+    let (payload, crc_bytes) = buf[..decoded_len].split_at(decoded_len - 1);
+    if crc8(payload) != crc_bytes[0] {
+        return Err(Error::BadCrc);
+    }
+    postcard::from_bytes(payload).map_err(|_| Error::Deserialize)
 }
 
 #[cfg(test)]

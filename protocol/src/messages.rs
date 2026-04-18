@@ -41,6 +41,9 @@ pub enum DeviceToHost {
     VolumeDelta { app_id: u32, delta: i8 },
     /// Request the host to toggle mute on the given app.
     MuteToggle { app_id: u32 },
+    /// Ack that the firmware has fully processed a command from the host.
+    /// Used by the companion as flow control for large writes (icon pushes).
+    Ack,
 }
 
 /// Minimal info about an audio app. Icons are sent separately via `SetAppIcon`.

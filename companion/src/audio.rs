@@ -29,6 +29,9 @@ pub struct AudioSession {
     /// Executable name (e.g. "chrome.exe"). Empty for system sounds (pid 0)
     /// or processes we can't open.
     pub process_name: String,
+    /// Full path to the executable (for icon extraction). Empty when we can't
+    /// open the process.
+    pub exe_path: String,
     /// Current master volume, 0.0..=1.0.
     pub volume: f32,
     pub muted: bool,
@@ -67,15 +70,22 @@ pub fn enumerate() -> windows::core::Result<Vec<AudioSession>> {
             let pid = ctrl2.GetProcessId().unwrap_or(0);
             let volume = vol.GetMasterVolume().unwrap_or(0.0);
             let muted = vol.GetMute().map(|b| b.as_bool()).unwrap_or(false);
-            let process_name = if pid != 0 {
-                get_process_name(pid).unwrap_or_default()
+            let (process_name, exe_path) = if pid != 0 {
+                let full = get_process_full_path(pid).unwrap_or_default();
+                let name = full
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(&full)
+                    .to_string();
+                (name, full)
             } else {
-                String::from("System Sounds")
+                (String::from("System Sounds"), String::new())
             };
 
             out.push(AudioSession {
                 pid,
                 process_name,
+                exe_path,
                 volume,
                 muted,
             });
@@ -126,7 +136,7 @@ where
     }
 }
 
-fn get_process_name(pid: u32) -> Option<String> {
+fn get_process_full_path(pid: u32) -> Option<String> {
     unsafe {
         let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 260];
@@ -141,15 +151,10 @@ fn get_process_name(pid: u32) -> Option<String> {
         if result.is_err() || len == 0 {
             return None;
         }
-        let full = OsString::from_wide(&buf[..len as usize])
-            .to_string_lossy()
-            .into_owned();
-        // Strip directory, keep only the file name (e.g. "chrome.exe")
         Some(
-            full.rsplit(['/', '\\'])
-                .next()
-                .unwrap_or(&full)
-                .to_string(),
+            OsString::from_wide(&buf[..len as usize])
+                .to_string_lossy()
+                .into_owned(),
         )
     }
 }

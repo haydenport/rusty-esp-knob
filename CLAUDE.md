@@ -13,8 +13,8 @@ cargo build
 cargo run
 ```
 
-- `cargo build` compiles the firmware
-- `cargo run` flashes to device and opens the serial monitor
+- `cargo build` compiles the firmware — use this to check for errors
+- `cargo run` flashes to device and exits (no serial monitor) — use this to deploy
 - Do NOT use `cargo espflash` or `espflash` directly — `cargo run` uses the runner configured in `.cargo/config.toml`
 
 ## Architecture

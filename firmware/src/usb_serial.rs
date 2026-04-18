@@ -9,14 +9,29 @@ use esp_hal::Blocking;
 use protocol::codec::{self, Decoder};
 use protocol::messages::{DeviceToHost, HostToDevice};
 
-/// Bounded read buffer. Small for now — bump when SetAppIcon lands in Phase 6
-/// (a 64×64 RGB565 icon is ~8 KB, but that requires a bigger heap first).
-const MAX_FRAME_LEN: usize = 1024;
+/// Bounded read buffer. Sized to fit a 64×64 RGB565 icon frame (~8 KB of pixel
+/// data plus postcard/COBS/CRC overhead).
+const MAX_FRAME_LEN: usize = 12 * 1024;
+
+/// Diagnostic counters — displayed on screen so we can see what the transport
+/// is actually doing without any log output.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RxStats {
+    pub bytes: u32,
+    pub ok: u32,
+    pub err: u32,
+    pub overflow: u32,
+    /// Count of outgoing frames dropped because the TX FIFO stayed full past
+    /// the per-byte spin budget. Happens when the host isn't reading (e.g.
+    /// the companion has exited).
+    pub tx_drop: u32,
+}
 
 pub struct UsbSerial<'d> {
     jtag: UsbSerialJtag<'d, Blocking>,
     decoder: Decoder,
     scratch: [u8; 128],
+    stats: RxStats,
 }
 
 impl<'d> UsbSerial<'d> {
@@ -25,13 +40,23 @@ impl<'d> UsbSerial<'d> {
             jtag,
             decoder: Decoder::new(MAX_FRAME_LEN),
             scratch: [0; 128],
+            stats: RxStats::default(),
         }
+    }
+
+    pub fn stats(&self) -> RxStats {
+        self.stats
     }
 
     /// Drain the RX FIFO and try to decode the next message.
     ///
     /// Returns `Some(msg)` once a complete, CRC-valid frame has arrived.
-    /// Call repeatedly — multiple frames may already be buffered.
+    /// Call repeatedly — multiple frames may already be buffered. Reads at
+    /// most `scratch.len()` bytes per call so the main loop always makes
+    /// progress, even when the host is pushing bytes continuously. (An
+    /// earlier revision drained in a loop until the FIFO was empty; under a
+    /// sustained ~8 KB icon push the loop never exited, starving encoder
+    /// and display updates.)
     pub fn poll(&mut self) -> Option<HostToDevice> {
         let mut n = 0;
         while n < self.scratch.len() {
@@ -44,19 +69,53 @@ impl<'d> UsbSerial<'d> {
             }
         }
         if n > 0 {
-            let _ = self.decoder.push(&self.scratch[..n]);
+            self.stats.bytes = self.stats.bytes.saturating_add(n as u32);
+            if self.decoder.push(&self.scratch[..n]).is_err() {
+                self.stats.overflow = self.stats.overflow.saturating_add(1);
+            }
         }
         match self.decoder.next_frame() {
-            Ok(Some(msg)) => Some(msg),
+            Ok(Some(msg)) => {
+                self.stats.ok = self.stats.ok.saturating_add(1);
+                Some(msg)
+            }
             Ok(None) => None,
-            Err(_) => None,
+            Err(_) => {
+                self.stats.err = self.stats.err.saturating_add(1);
+                None
+            }
         }
     }
 
     /// Serialize + frame + write a message to the host.
+    ///
+    /// Non-blocking: the IN FIFO is written byte-by-byte with a bounded
+    /// spin budget per byte. If the host isn't draining the FIFO (e.g. the
+    /// companion has exited), the frame is dropped and `tx_drop` is bumped.
+    /// The blocking `UsbSerialJtag::write` would spin forever in that
+    /// case, wedging the main loop the next time we try to send an event.
     pub fn send(&mut self, msg: &DeviceToHost) -> Result<(), codec::Error> {
+        const SPIN_BUDGET: u32 = 20_000;
         let bytes = codec::encode(msg)?;
-        self.jtag.write(&bytes).map_err(|_| codec::Error::Serialize)?;
+        for &b in &bytes {
+            let mut tries = 0u32;
+            loop {
+                match self.jtag.write_byte_nb(b) {
+                    Ok(()) => break,
+                    Err(_) => {
+                        tries += 1;
+                        if tries >= SPIN_BUDGET {
+                            self.stats.tx_drop = self.stats.tx_drop.saturating_add(1);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        // Commit the short packet. If flush won't complete right now, that's
+        // fine — hardware auto-flushes on the next full 64-byte packet or
+        // when the host next polls.
+        let _ = self.jtag.flush_tx_nb();
         Ok(())
     }
 }

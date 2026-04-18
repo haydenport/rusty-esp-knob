@@ -75,7 +75,7 @@ Files:
 
 **Testable outcome**: CLI prints list of apps and their current volumes.
 
-## Phase 6: PC Companion - Serial + Icon Extraction
+## Phase 6: PC Companion - Serial + Icon Extraction - DONE
 
 **Goal**: Connect companion to device over USB CDC, extract app icons.
 
