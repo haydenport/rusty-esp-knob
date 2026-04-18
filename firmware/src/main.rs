@@ -33,7 +33,6 @@ use u8g2_fonts::FontRenderer;
 use u8g2_fonts::fonts::{u8g2_font_helvR24_tr, u8g2_font_logisoso62_tn};
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 
-use alloc::string::String;
 use alloc::vec::Vec;
 
 use encoder::Encoder;
@@ -77,12 +76,12 @@ fn to_wire_gesture(g: touch::Gesture) -> Option<GestureKind> {
     }
 }
 
-/// Draw the current volume percentage in the center of the screen.
-/// Renders the digits with the large logisoso62 font and "%" with helvR24,
-/// since logisoso62_tn is numbers-only and doesn't contain the '%' glyph.
+/// Draw the current volume percentage.
+/// Layout: volume area occupies y=158-248, below the app-name band (y=114-154).
+/// Renders digits with logisoso62 (numbers-only) and "%" with helvR24.
 fn draw_volume(display: &mut Sh8601, volume: u8) {
     use core::fmt::Write;
-    Rectangle::new(Point::new(30, 110), Size::new(300, 130))
+    Rectangle::new(Point::new(30, 158), Size::new(300, 90))
         .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
         .draw(display)
         .unwrap();
@@ -93,7 +92,7 @@ fn draw_volume(display: &mut Sh8601, volume: u8) {
     let big = FontRenderer::new::<u8g2_font_logisoso62_tn>();
     let _ = big.render_aligned(
         num_buf.as_str(),
-        Point::new(160, 180),
+        Point::new(160, 228),
         VerticalPosition::Baseline,
         HorizontalAlignment::Center,
         FontColor::Transparent(Rgb565::WHITE),
@@ -103,7 +102,7 @@ fn draw_volume(display: &mut Sh8601, volume: u8) {
     let small = FontRenderer::new::<u8g2_font_helvR24_tr>();
     let _ = small.render_aligned(
         "%",
-        Point::new(230, 180),
+        Point::new(230, 228),
         VerticalPosition::Baseline,
         HorizontalAlignment::Left,
         FontColor::Transparent(Rgb565::CSS_GRAY),
@@ -111,26 +110,9 @@ fn draw_volume(display: &mut Sh8601, volume: u8) {
     );
 }
 
-/// Draw the page index at the bottom of the screen.
-fn draw_page(display: &mut Sh8601, page: i32) {
-    use core::fmt::Write;
-    Rectangle::new(Point::new(80, 290), Size::new(200, 40))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
-        .draw(display)
-        .unwrap();
-
-    let mut buf = heapless::String::<24>::new();
-    let _ = write!(buf, "Page {}", page);
-
-    let font = FontRenderer::new::<u8g2_font_helvR24_tr>();
-    font.render_aligned(
-        &*buf,
-        Point::new(180, 320),
-        VerticalPosition::Baseline,
-        HorizontalAlignment::Center,
-        FontColor::Transparent(Rgb565::CSS_GRAY),
-        display,
-    ).unwrap();
+/// Show or clear a "MUTED" label just below the volume area (y=248).
+fn draw_mute_indicator(display: &mut Sh8601, muted: bool) {
+    draw_status(display, if muted { "MUTED" } else { "" });
 }
 
 /// Blit a raw RGB565 image (big-endian, width×height pixels) to the display.
@@ -252,6 +234,7 @@ fn main() -> ! {
     // ~295 KB is the ceiling before the heap collides with the stack region.
     esp_alloc::heap_allocator!(size: 290_000);
 
+
     info!("Volume Knob Controller - firmware starting");
 
     // Backlight on
@@ -290,7 +273,6 @@ fn main() -> ! {
     // Draw initial screen
     display.clear(Rgb565::BLACK).unwrap();
     draw_volume(&mut display, 0);
-    draw_page(&mut display, 0);
     display.flush().expect("Flush failed");
     info!("Screen drawn");
 
@@ -322,14 +304,18 @@ fn main() -> ! {
 
     let delay = Delay::new();
     let mut last_count: i32 = 0;
-    let mut page: i32 = 0;
     let mut needs_flush = false;
 
     // App-list state pushed by the host via SetAppList / SetSelectedApp.
     let mut apps: Vec<AppInfo> = Vec::new();
     let mut selected_app: Option<u32> = None;
+    // Index into `apps` for carousel navigation.
+    let mut selected_idx: usize = 0;
+    // Icon for the currently-selected app (RGB565). Cleared on app switch;
+    // repopulated when the companion pushes SetAppIcon in response to AppSelected.
     let mut current_icon: Vec<u8> = Vec::new();
     let mut current_volume: u8 = 0;
+    let mut current_muted: bool = false;
     let mut loop_tick: u32 = 0;
     loop {
         loop_tick = loop_tick.wrapping_add(1);
@@ -350,9 +336,13 @@ fn main() -> ! {
             }
             match event.gesture {
                 touch::Gesture::SingleTap => {
-                    haptic.play(&mut i2c, Effect::SharpClick);
-                    draw_status(&mut display, "TAP");
-                    needs_flush = true;
+                    // Tap toggles mute for the selected app. Companion will
+                    // set the WASAPI mute and echo back SetMute so we can
+                    // update the display.
+                    if let Some(id) = selected_app {
+                        haptic.play(&mut i2c, Effect::SharpClick);
+                        let _ = usb.send(&DeviceToHost::MuteToggle { app_id: id });
+                    }
                 }
                 touch::Gesture::LongPress => {
                     haptic.play(&mut i2c, Effect::StrongClick);
@@ -360,18 +350,34 @@ fn main() -> ! {
                     needs_flush = true;
                 }
                 touch::Gesture::SwipeLeft => {
-                    page -= 1;
-                    info!("Page: {}", page);
-                    draw_page(&mut display, page);
-                    draw_status(&mut display, "< SWIPE");
-                    needs_flush = true;
+                    if !apps.is_empty() {
+                        selected_idx = (selected_idx + apps.len() - 1) % apps.len();
+                        let app = &apps[selected_idx];
+                        selected_app = Some(app.id);
+                        current_volume = app.volume;
+                        current_muted = app.muted;
+                        current_icon.clear();
+                        haptic.play(&mut i2c, Effect::SharpClick);
+                        redraw_app(&mut display, &apps, selected_app, &[], current_volume);
+                        draw_mute_indicator(&mut display, current_muted);
+                        let _ = usb.send(&DeviceToHost::AppSelected(app.id));
+                        needs_flush = true;
+                    }
                 }
                 touch::Gesture::SwipeRight => {
-                    page += 1;
-                    info!("Page: {}", page);
-                    draw_page(&mut display, page);
-                    draw_status(&mut display, "SWIPE >");
-                    needs_flush = true;
+                    if !apps.is_empty() {
+                        selected_idx = (selected_idx + 1) % apps.len();
+                        let app = &apps[selected_idx];
+                        selected_app = Some(app.id);
+                        current_volume = app.volume;
+                        current_muted = app.muted;
+                        current_icon.clear();
+                        haptic.play(&mut i2c, Effect::SharpClick);
+                        redraw_app(&mut display, &apps, selected_app, &[], current_volume);
+                        draw_mute_indicator(&mut display, current_muted);
+                        let _ = usb.send(&DeviceToHost::AppSelected(app.id));
+                        needs_flush = true;
+                    }
                 }
                 _ => {}
             }
@@ -402,13 +408,18 @@ fn main() -> ! {
                     apps = list;
                     if selected_app.is_none() {
                         selected_app = apps.first().map(|a| a.id);
+                        selected_idx = 0;
+                    } else {
+                        selected_idx = apps.iter().position(|a| Some(a.id) == selected_app).unwrap_or(0);
                     }
                     if let Some(id) = selected_app {
                         if let Some(app) = apps.iter().find(|a| a.id == id) {
                             current_volume = app.volume;
+                            current_muted = app.muted;
                         }
                     }
                     redraw_app(&mut display, &apps, selected_app, &current_icon, current_volume);
+                    draw_mute_indicator(&mut display, current_muted);
                     needs_flush = true;
                 }
                 HostToDevice::SetAppIcon { app_id, pixels } => {
@@ -420,17 +431,35 @@ fn main() -> ! {
                 }
                 HostToDevice::SetSelectedApp(id) => {
                     selected_app = Some(id);
+                    selected_idx = apps.iter().position(|a| a.id == id).unwrap_or(0);
                     current_icon.clear();
                     if let Some(app) = apps.iter().find(|a| a.id == id) {
                         current_volume = app.volume;
+                        current_muted = app.muted;
                     }
                     redraw_app(&mut display, &apps, selected_app, &current_icon, current_volume);
+                    draw_mute_indicator(&mut display, current_muted);
                     needs_flush = true;
                 }
                 HostToDevice::SetVolume { app_id, level } => {
+                    // Update the local app list so stale volumes aren't shown after a swipe.
+                    if let Some(app) = apps.iter_mut().find(|a| a.id == app_id) {
+                        app.volume = level;
+                    }
                     if selected_app == Some(app_id) {
                         current_volume = level;
                         draw_volume(&mut display, current_volume);
+                        needs_flush = true;
+                    }
+                }
+                HostToDevice::SetMute { app_id, muted } => {
+                    if let Some(app) = apps.iter_mut().find(|a| a.id == app_id) {
+                        app.muted = muted;
+                    }
+                    if selected_app == Some(app_id) {
+                        current_muted = muted;
+                        haptic.play(&mut i2c, Effect::SharpClick);
+                        draw_mute_indicator(&mut display, current_muted);
                         needs_flush = true;
                     }
                 }

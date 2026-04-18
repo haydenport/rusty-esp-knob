@@ -39,6 +39,8 @@ pub enum DeviceToHost {
     Gesture(GestureKind),
     /// Request the host to adjust the selected app's volume by a relative amount.
     VolumeDelta { app_id: u32, delta: i8 },
+    /// Notify the host that the user swiped to a different app.
+    AppSelected(u32),
     /// Request the host to toggle mute on the given app.
     MuteToggle { app_id: u32 },
     /// Ack that the firmware has fully processed a command from the host.

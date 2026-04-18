@@ -239,9 +239,11 @@ fn cmd_run(port_name: &str) {
     };
 
     let mut app_infos: Vec<AppInfo> = Vec::new();
-    let mut icons_out: Vec<(u32, Vec<u8>)> = Vec::new();
-    // Local volume cache: app_id (pid) → 0.0..=1.0
+    // Local state caches: app_id (pid) → value.
+    // icons keeps pixels alive so they can be re-pushed on AppSelected.
     let mut volumes: HashMap<u32, f32> = HashMap::new();
+    let mut mutes: HashMap<u32, bool> = HashMap::new();
+    let mut icons: HashMap<u32, Vec<u8>> = HashMap::new();
 
     for (idx, s) in sessions.iter().enumerate() {
         if s.exe_path.is_empty() { continue; }
@@ -253,8 +255,9 @@ fn cmd_run(port_name: &str) {
             muted: s.muted,
         });
         volumes.insert(id, s.volume);
+        mutes.insert(id, s.muted);
         match icons::extract_rgb565(&s.exe_path) {
-            Some(px) => { println!("[{idx}] {} ({}B icon)", s.process_name, px.len()); icons_out.push((id, px)); }
+            Some(px) => { println!("[{idx}] {} ({}B icon)", s.process_name, px.len()); icons.insert(id, px); }
             None => { println!("[{idx}] {} (no icon)", s.process_name); }
         }
     }
@@ -285,9 +288,9 @@ fn cmd_run(port_name: &str) {
     send_and_wait(&mut *port, &mut decoder, &HostToDevice::SetAppList(app_infos));
     println!(">>> sending SetSelectedApp({first_id})");
     send_and_wait(&mut *port, &mut decoder, &HostToDevice::SetSelectedApp(first_id));
-    for (app_id, pixels) in icons_out {
+    for (&app_id, pixels) in &icons {
         println!(">>> sending SetAppIcon(app_id={app_id}, {}B)", pixels.len());
-        send_and_wait(&mut *port, &mut decoder, &HostToDevice::SetAppIcon { app_id, pixels });
+        send_and_wait(&mut *port, &mut decoder, &HostToDevice::SetAppIcon { app_id, pixels: pixels.clone() });
     }
 
     println!("\n>>> running — turn the knob to change volume, Ctrl+C to exit");
@@ -310,6 +313,32 @@ fn cmd_run(port_name: &str) {
                                     send(&mut *port, &HostToDevice::SetVolume { app_id, level });
                                 }
                                 Err(e) => eprintln!("set_volume({app_id}): {e}"),
+                            }
+                        }
+                        Ok(Some(DeviceToHost::AppSelected(app_id))) => {
+                            // Firmware swiped to a new app — push the live volume and
+                            // re-push the icon so the display updates after the swipe.
+                            if let Some(&vol) = volumes.get(&app_id) {
+                                let level = (vol * 100.0).round() as u8;
+                                send(&mut *port, &HostToDevice::SetVolume { app_id, level });
+                            }
+                            if let Some(pixels) = icons.get(&app_id) {
+                                send(&mut *port, &HostToDevice::SetAppIcon {
+                                    app_id,
+                                    pixels: pixels.clone(),
+                                });
+                            }
+                        }
+                        Ok(Some(DeviceToHost::MuteToggle { app_id })) => {
+                            let currently = *mutes.get(&app_id).unwrap_or(&false);
+                            let new_muted = !currently;
+                            match audio::set_mute(app_id, new_muted) {
+                                Ok(()) => {
+                                    mutes.insert(app_id, new_muted);
+                                    println!("mute {app_id} → {new_muted}");
+                                    send(&mut *port, &HostToDevice::SetMute { app_id, muted: new_muted });
+                                }
+                                Err(e) => eprintln!("set_mute({app_id}): {e}"),
                             }
                         }
                         Ok(Some(DeviceToHost::Ack)) => {}

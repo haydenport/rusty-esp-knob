@@ -93,7 +93,7 @@ Files:
 
 **Testable outcome**: Full loop -- rotate knob, see volume change on both display and PC mixer.
 
-## Phase 8: Carousel UI + Mute
+## Phase 8: Carousel UI + Mute - DONE
 
 **Goal**: Swipe through apps on display, tap to mute/unmute.
 
