@@ -103,7 +103,7 @@ Files:
 
 **Testable outcome**: Swipe between apps, tap to mute, visual + haptic confirmation.
 
-## Phase 9: System Tray + Settings + Polish
+## Phase 9: System Tray + Settings + Polish - DONE
 
 **Goal**: Tray app, user settings, startup behavior.
 
