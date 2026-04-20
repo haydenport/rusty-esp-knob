@@ -115,6 +115,24 @@ fn draw_mute_indicator(display: &mut Sh8601, muted: bool) {
     draw_status(display, if muted { "MUTED" } else { "" });
 }
 
+/// Full-screen "waiting for companion" state. Shown at boot and after the
+/// companion disconnects. Clears the screen and draws a small "NOT DETECTED"
+/// label at the top. The caller is expected to follow up with draw_volume so
+/// the standalone encoder value is visible in the centre.
+fn draw_not_connected(display: &mut Sh8601) {
+    use u8g2_fonts::fonts::u8g2_font_profont15_tr;
+    display.clear(Rgb565::BLACK).unwrap();
+    let font = FontRenderer::new::<u8g2_font_profont15_tr>();
+    font.render_aligned(
+        "NOT DETECTED",
+        Point::new(180, 35),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(Rgb565::YELLOW),
+        display,
+    ).unwrap();
+}
+
 /// Blit a raw RGB565 image (big-endian, width×height pixels) to the display.
 fn draw_icon(display: &mut Sh8601, pixels: &[u8], width: u32, height: u32, origin: Point) {
     use embedded_graphics::image::{Image, ImageRaw};
@@ -270,9 +288,9 @@ fn main() -> ! {
     display.init().expect("Display init failed");
     info!("Display initialized");
 
-    // Draw initial screen
-    display.clear(Rgb565::BLACK).unwrap();
-    draw_volume(&mut display, 0);
+    // Draw initial screen — companion not yet connected.
+    draw_not_connected(&mut display);
+    draw_volume(&mut display, 50);
     display.flush().expect("Flush failed");
     info!("Screen drawn");
 
@@ -317,6 +335,14 @@ fn main() -> ! {
     let mut current_volume: u8 = 0;
     let mut current_muted: bool = false;
     let mut loop_tick: u32 = 0;
+    // Value shown by the encoder when no companion is connected (0-100).
+    let mut standalone_value: u8 = 50;
+    // Tick at which the last host message arrived. Used to detect companion
+    // disconnect: if no message for ~3 000 ticks (~9 s at 3 ms/tick) while
+    // apps are loaded, we clear the app list and return to the not-connected
+    // screen. The companion sends heartbeat Pings every 5 s so this fires
+    // roughly two missed heartbeats after a real disconnect.
+    let mut last_host_msg_tick: u32 = 0;
     loop {
         loop_tick = loop_tick.wrapping_add(1);
         encoder.poll();
@@ -326,6 +352,11 @@ fn main() -> ! {
             haptic.play(&mut i2c, Effect::SharpClick);
             if let Some(app_id) = selected_app {
                 let _ = usb.send(&DeviceToHost::VolumeDelta { app_id, delta });
+            } else {
+                standalone_value = (standalone_value as i16 + delta as i16)
+                    .clamp(0, 100) as u8;
+                draw_volume(&mut display, standalone_value);
+                needs_flush = true;
             }
             last_count = count;
         }
@@ -390,6 +421,7 @@ fn main() -> ! {
         // the companion can flow-control large writes (icon pushes) — the PC
         // waits for the Ack before sending the next message.
         while let Some(msg) = usb.poll() {
+            last_host_msg_tick = loop_tick;
             if !ready_sent {
                 let _ = usb.send(&DeviceToHost::Ready { version: PROTOCOL_VERSION });
                 ready_sent = true;
@@ -474,6 +506,17 @@ fn main() -> ! {
             if ack {
                 let _ = usb.send(&DeviceToHost::Ack);
             }
+        }
+
+        // Detect companion disconnect: ~9 s of silence (3 000 ticks × 3 ms)
+        // while an app list is loaded means the companion has gone away.
+        if !apps.is_empty() && loop_tick.wrapping_sub(last_host_msg_tick) > 3_000 {
+            apps.clear();
+            selected_app = None;
+            current_icon.clear();
+            draw_not_connected(&mut display);
+            draw_volume(&mut display, standalone_value);
+            needs_flush = true;
         }
 
         // Trigger a periodic flush every ~600 ms so the stats line stays live

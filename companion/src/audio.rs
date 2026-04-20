@@ -72,11 +72,12 @@ pub fn enumerate() -> windows::core::Result<Vec<AudioSession>> {
             let muted = vol.GetMute().map(|b| b.as_bool()).unwrap_or(false);
             let (process_name, exe_path) = if pid != 0 {
                 let full = get_process_full_path(pid).unwrap_or_default();
-                let name = full
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or(&full)
-                    .to_string();
+                let filename = full.rsplit(['/', '\\']).next().unwrap_or(&full);
+                let name = if filename.to_ascii_lowercase().ends_with(".exe") {
+                    filename[..filename.len() - 4].to_string()
+                } else {
+                    filename.to_string()
+                };
                 (name, full)
             } else {
                 (String::from("System Sounds"), String::new())

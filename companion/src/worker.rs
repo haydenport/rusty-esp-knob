@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,6 +27,15 @@ pub fn run(
     stop: Arc<AtomicBool>,
     status_tx: std::sync::mpsc::Sender<WorkerStatus>,
 ) {
+    // Initialize COM for this thread. In CLI mode the caller already did this
+    // on the same thread (S_FALSE = already initialized, not an error). In tray
+    // mode the worker runs on a spawned thread that hasn't initialized COM yet.
+    if let Err(e) = audio::init() {
+        eprintln!("COM init failed on worker thread: {e}");
+        let _ = status_tx.send(WorkerStatus::Error(format!("COM: {e}")));
+        return;
+    }
+
     let sessions = match audio::enumerate() {
         Ok(s) => s,
         Err(e) => {
@@ -40,9 +49,11 @@ pub fn run(
     let mut volumes: HashMap<u32, f32> = HashMap::new();
     let mut mutes: HashMap<u32, bool> = HashMap::new();
     let mut icons: HashMap<u32, Vec<u8>> = HashMap::new();
+    let mut seen_pids: HashSet<u32> = HashSet::new();
 
     for (idx, s) in sessions.iter().enumerate() {
-        if s.exe_path.is_empty() {
+        // Skip system-sounds (pid 0) and duplicate PIDs (multiple streams per app).
+        if s.pid == 0 || !seen_pids.insert(s.pid) {
             continue;
         }
         let id = s.pid;
@@ -54,12 +65,16 @@ pub fn run(
         });
         volumes.insert(id, s.volume);
         mutes.insert(id, s.muted);
-        match icons::extract_rgb565(&s.exe_path) {
-            Some(px) => {
-                println!("[{idx}] {} ({}B icon)", s.process_name, px.len());
-                icons.insert(id, px);
+        if !s.exe_path.is_empty() {
+            match icons::extract_rgb565(&s.exe_path) {
+                Some(px) => {
+                    println!("[{idx}] {} pid={id} ({}B icon)", s.process_name, px.len());
+                    icons.insert(id, px);
+                }
+                None => println!("[{idx}] {} pid={id} (no icon)", s.process_name),
             }
-            None => println!("[{idx}] {} (no icon)", s.process_name),
+        } else {
+            println!("[{idx}] {} pid={id} (no exe path)", s.process_name);
         }
     }
 
@@ -70,7 +85,7 @@ pub fn run(
     }
 
     let mut port = match serialport::new(port_name, 115_200)
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(2))
         .open()
     {
         Ok(p) => p,
@@ -99,9 +114,11 @@ pub fn run(
 
     let first_id = app_infos[0].id;
     println!(">>> sending SetAppList ({} apps)", app_infos.len());
-    send_and_wait(&mut *port, &mut decoder, &HostToDevice::SetAppList(app_infos));
+    send_and_wait(&mut *port, &mut decoder, &HostToDevice::SetAppList(app_infos.clone()));
+    println!(">>> SetAppList ack'd");
     println!(">>> sending SetSelectedApp({first_id})");
     send_and_wait(&mut *port, &mut decoder, &HostToDevice::SetSelectedApp(first_id));
+    println!(">>> SetSelectedApp ack'd");
     for (&app_id, pixels) in &icons {
         println!(">>> sending SetAppIcon(app_id={app_id}, {}B)", pixels.len());
         send_and_wait(
@@ -109,10 +126,13 @@ pub fn run(
             &mut decoder,
             &HostToDevice::SetAppIcon { app_id, pixels: pixels.clone() },
         );
+        println!(">>> SetAppIcon({app_id}) ack'd");
     }
 
     println!(">>> running — Ctrl+C or tray Exit to stop");
     let mut buf = [0u8; 256];
+    let mut last_refresh = Instant::now();
+    let mut last_heartbeat = Instant::now();
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -139,15 +159,25 @@ pub fn run(
                             }
                         }
                         Ok(Some(DeviceToHost::AppSelected(app_id))) => {
+                            println!("<<< AppSelected({app_id})");
+                            // Send SetVolume first and wait for Ack — the firmware
+                            // flushes the display after SetVolume, and we must wait
+                            // for that flush to complete before sending the large
+                            // icon frame, otherwise the USB RX FIFO backs up and
+                            // the write fails with ERROR_SEM_TIMEOUT.
                             if let Some(&vol) = volumes.get(&app_id) {
                                 let level = (vol * 100.0).round() as u8;
-                                send(&mut *port, &HostToDevice::SetVolume { app_id, level });
+                                println!("  → SetVolume({app_id}, {level}%)");
+                                send_and_wait(&mut *port, &mut decoder, &HostToDevice::SetVolume { app_id, level });
+                            } else {
+                                println!("  → no volume entry for pid {app_id}");
                             }
                             if let Some(pixels) = icons.get(&app_id) {
-                                send(&mut *port, &HostToDevice::SetAppIcon {
-                                    app_id,
-                                    pixels: pixels.clone(),
-                                });
+                                let pixels = pixels.clone();
+                                println!("  → SetAppIcon({app_id}, {}B)", pixels.len());
+                                send_and_wait(&mut *port, &mut decoder, &HostToDevice::SetAppIcon { app_id, pixels });
+                            } else {
+                                println!("  → no icon for pid {app_id}");
                             }
                         }
                         Ok(Some(DeviceToHost::MuteToggle { app_id })) => {
@@ -166,6 +196,7 @@ pub fn run(
                             }
                         }
                         Ok(Some(DeviceToHost::Ack)) => {}
+                        Ok(Some(DeviceToHost::Pong)) => {}
                         Ok(Some(other)) => println!("<<< {other:?}"),
                         Ok(None) => break,
                         Err(e) => {
@@ -182,6 +213,57 @@ pub fn run(
                 eprintln!("read error: {e}");
                 let _ = status_tx.send(WorkerStatus::Disconnected);
                 break;
+            }
+        }
+
+        // Heartbeat: keep the firmware's disconnect timer from firing while connected.
+        if last_heartbeat.elapsed() >= Duration::from_secs(5) {
+            last_heartbeat = Instant::now();
+            send(&mut *port, &HostToDevice::Ping);
+        }
+
+        // Periodically re-enumerate audio sessions so newly-launched apps appear.
+        if last_refresh.elapsed() >= Duration::from_secs(5) {
+            last_refresh = Instant::now();
+            if let Ok(new_sessions) = audio::enumerate() {
+                let mut new_app_infos: Vec<AppInfo> = Vec::new();
+                let mut seen: HashSet<u32> = HashSet::new();
+                for s in &new_sessions {
+                    if s.pid == 0 || !seen.insert(s.pid) {
+                        continue;
+                    }
+                    new_app_infos.push(AppInfo {
+                        id: s.pid,
+                        name: s.process_name.clone(),
+                        volume: (s.volume * 100.0).round().clamp(0.0, 100.0) as u8,
+                        muted: s.muted,
+                    });
+                }
+
+                let old_pids: HashSet<u32> = app_infos.iter().map(|a| a.id).collect();
+                let new_pids: HashSet<u32> = new_app_infos.iter().map(|a| a.id).collect();
+
+                if old_pids != new_pids {
+                    println!("sessions updated: {} → {} apps", app_infos.len(), new_app_infos.len());
+
+                    // Extract icons for any brand-new apps, update volumes/mutes for all.
+                    for s in &new_sessions {
+                        if s.pid == 0 || !new_pids.contains(&s.pid) {
+                            continue;
+                        }
+                        volumes.insert(s.pid, s.volume);
+                        mutes.insert(s.pid, s.muted);
+                        if !icons.contains_key(&s.pid) && !s.exe_path.is_empty() {
+                            if let Some(px) = icons::extract_rgb565(&s.exe_path) {
+                                println!("  extracted icon for {} pid={}", s.process_name, s.pid);
+                                icons.insert(s.pid, px);
+                            }
+                        }
+                    }
+
+                    app_infos = new_app_infos.clone();
+                    send(&mut *port, &HostToDevice::SetAppList(new_app_infos));
+                }
             }
         }
     }
