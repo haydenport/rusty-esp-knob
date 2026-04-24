@@ -16,7 +16,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 use esp_hal::delay::Delay;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
 use esp_hal::dma_buffers;
-use esp_hal::gpio::{Level, Output, OutputConfig};
+use esp_hal::gpio::{Io, Level, Output, OutputConfig};
 use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::main;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
@@ -28,9 +28,9 @@ use protocol::messages::{DeviceToHost, GestureKind, HostToDevice, PROTOCOL_VERSI
 
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, StrokeAlignment};
+use embedded_graphics::primitives::{Arc, Circle, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, StrokeAlignment};
 use u8g2_fonts::FontRenderer;
-use u8g2_fonts::fonts::{u8g2_font_helvR24_tr, u8g2_font_logisoso62_tn};
+use u8g2_fonts::fonts::u8g2_font_helvR24_tr;
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
 
 use alloc::vec::Vec;
@@ -44,7 +44,7 @@ use usb_serial::UsbSerial;
 
 const ICON_SIZE: u32 = 64;
 const ICON_X: i32 = (360 - ICON_SIZE as i32) / 2;
-const ICON_Y: i32 = 40;
+const ICON_Y: i32 = 60;
 
 /// Redraw the icon, name, and volume for the currently-selected app.
 fn redraw_app(
@@ -76,38 +76,164 @@ fn to_wire_gesture(g: touch::Gesture) -> Option<GestureKind> {
     }
 }
 
-/// Draw the current volume percentage.
-/// Layout: volume area occupies y=158-248, below the app-name band (y=114-154).
-/// Renders digits with logisoso62 (numbers-only) and "%" with helvR24.
+/// Draw a circular arc bar on the outer edge showing `volume` (0–100).
+/// A 270° track (lower-left → over the top → lower-right) is drawn in dim gray;
+/// the filled portion grows clockwise from lower-left proportional to volume.
+/// Filled circles are placed at each cap to give a rounded end-cap appearance.
 fn draw_volume(display: &mut Sh8601, volume: u8) {
-    use core::fmt::Write;
-    Rectangle::new(Point::new(30, 158), Size::new(300, 90))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+    // Arc center = (180, 180). top_left = center - radius = (10, 10), diameter = 340.
+    // Stroke 14 px → cap circles have the same diameter so they blend seamlessly.
+    const TOP_LEFT: Point = Point::new(10, 10);
+    const DIAMETER: u32 = 340;
+    const STROKE: u32 = 14;
+    const START_DEG: f32 = 135.0; // 7:30 o'clock (lower-left)
+    const SWEEP_DEG: f32 = 270.0; // ends at 4:30 o'clock (lower-right)
+    // Arc path radius (= DIAMETER/2 = 170). Used for cap centre maths.
+    const ARC_R: f32 = 170.0;
+
+    // Pre-computed cap centres for the fixed track endpoints.
+    // 135°: x = 180 + 170*cos(135°) = 180 - 120.2 ≈ 60, y = 180 + 170*sin(135°) ≈ 300
+    const CAP_START: Point = Point::new(60, 300);
+    // 405°=45°: x = 180 + 170*cos(45°) ≈ 300, y ≈ 300
+    const CAP_END: Point = Point::new(300, 300);
+
+    // Full track in dim gray, then round caps at both track endpoints.
+    Arc::new(TOP_LEFT, DIAMETER, Angle::from_degrees(START_DEG), Angle::from_degrees(SWEEP_DEG))
+        .into_styled(PrimitiveStyle::with_stroke(Rgb565::CSS_DIM_GRAY, STROKE))
+        .draw(display)
+        .unwrap();
+    draw_arc_cap(display, CAP_START, STROKE, Rgb565::CSS_DIM_GRAY);
+    draw_arc_cap(display, CAP_END, STROKE, Rgb565::CSS_DIM_GRAY);
+
+    // Filled portion proportional to volume.
+    let fill_sweep = SWEEP_DEG * (volume as f32 / 100.0);
+    if fill_sweep >= 1.0 {
+        Arc::new(
+            TOP_LEFT,
+            DIAMETER,
+            Angle::from_degrees(START_DEG),
+            Angle::from_degrees(fill_sweep),
+        )
+        .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, STROKE))
         .draw(display)
         .unwrap();
 
-    let mut num_buf = heapless::String::<4>::new();
-    let _ = write!(num_buf, "{}", volume);
+        // White cap at fill start (overlays the gray one).
+        draw_arc_cap(display, CAP_START, STROKE, Rgb565::WHITE);
 
-    let big = FontRenderer::new::<u8g2_font_logisoso62_tn>();
-    let _ = big.render_aligned(
-        num_buf.as_str(),
-        Point::new(160, 228),
-        VerticalPosition::Baseline,
-        HorizontalAlignment::Center,
-        FontColor::Transparent(Rgb565::WHITE),
-        display,
-    );
+        // White cap at fill tip — position computed at runtime from the sweep angle.
+        let tip_rad = (START_DEG + fill_sweep) * (core::f32::consts::PI / 180.0);
+        let tx = 180 + (ARC_R * libm::cosf(tip_rad)) as i32;
+        let ty = 180 + (ARC_R * libm::sinf(tip_rad)) as i32;
+        draw_arc_cap(display, Point::new(tx, ty), STROKE, Rgb565::WHITE);
+    }
+}
 
-    let small = FontRenderer::new::<u8g2_font_helvR24_tr>();
-    let _ = small.render_aligned(
-        "%",
-        Point::new(230, 228),
-        VerticalPosition::Baseline,
-        HorizontalAlignment::Left,
-        FontColor::Transparent(Rgb565::CSS_GRAY),
-        display,
-    );
+/// Draw a filled circle centred on `centre` with the given `diameter` (= arc stroke width).
+fn draw_arc_cap(display: &mut Sh8601, centre: Point, diameter: u32, color: Rgb565) {
+    let r = (diameter / 2) as i32;
+    Circle::new(Point::new(centre.x - r, centre.y - r), diameter)
+        .into_styled(PrimitiveStyle::with_fill(color))
+        .draw(display)
+        .unwrap();
+}
+
+/// Compute the point on the arc path at `sweep_deg` degrees from the start.
+/// Arc center = (180,180), radius = 170, start angle = 135°.
+fn arc_tip_point(sweep_deg: f32) -> Point {
+    let rad = (135.0_f32 + sweep_deg) * (core::f32::consts::PI / 180.0);
+    Point::new(
+        180 + (170.0_f32 * libm::cosf(rad)) as i32,
+        180 + (170.0_f32 * libm::sinf(rad)) as i32,
+    )
+}
+
+/// Incremental arc update: only redraws the segment that changed between
+/// `prev_vol` and `new_vol`, then returns the dirty `(y0, y1)` row range
+/// suitable for passing to `display.flush_rows`.
+///
+/// Much faster than `draw_volume` for small encoder steps because only
+/// the changed arc segment (a few degrees) is rendered, and only those
+/// rows need to be sent over QSPI.
+fn draw_volume_delta(display: &mut Sh8601, prev_vol: u8, new_vol: u8) -> (u16, u16) {
+    if prev_vol == new_vol {
+        return (0, 0);
+    }
+
+    const TOP_LEFT: Point = Point::new(10, 10);
+    const DIAMETER: u32 = 340;
+    const STROKE: u32 = 14;
+    const FULL_SWEEP: f32 = 270.0;
+    const CAP_START: Point = Point::new(60, 300);
+
+    let prev_sweep = FULL_SWEEP * (prev_vol as f32 / 100.0);
+    let new_sweep  = FULL_SWEEP * (new_vol  as f32 / 100.0);
+
+    if new_vol > prev_vol {
+        // Fill the newly covered segment in white.
+        let delta = new_sweep - prev_sweep;
+        Arc::new(TOP_LEFT, DIAMETER,
+            Angle::from_degrees(135.0 + prev_sweep),
+            Angle::from_degrees(delta))
+            .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, STROKE))
+            .draw(display).unwrap();
+        // Start cap becomes white when transitioning from vol=0.
+        if prev_vol == 0 {
+            draw_arc_cap(display, CAP_START, STROKE, Rgb565::WHITE);
+        }
+        // Advance tip cap to new position.
+        draw_arc_cap(display, arc_tip_point(new_sweep), STROKE, Rgb565::WHITE);
+    } else {
+        // Revert the newly vacated segment back to dim gray.
+        let delta = prev_sweep - new_sweep;
+        Arc::new(TOP_LEFT, DIAMETER,
+            Angle::from_degrees(135.0 + new_sweep),
+            Angle::from_degrees(delta))
+            .into_styled(PrimitiveStyle::with_stroke(Rgb565::CSS_DIM_GRAY, STROKE))
+            .draw(display).unwrap();
+        // Erase the old (white) tip cap.
+        if prev_vol > 0 {
+            draw_arc_cap(display, arc_tip_point(prev_sweep), STROKE, Rgb565::CSS_DIM_GRAY);
+        }
+        // Draw new tip cap, or restore gray start cap when vol hits 0.
+        if new_vol > 0 {
+            draw_arc_cap(display, arc_tip_point(new_sweep), STROKE, Rgb565::WHITE);
+        } else {
+            draw_arc_cap(display, CAP_START, STROKE, Rgb565::CSS_DIM_GRAY);
+        }
+    }
+
+    // Compute dirty row bounds including both cap positions and any arc extremes
+    // the segment may cross.
+    let cap_r = (STROKE / 2 + 1) as i32;
+    let p_old = if prev_vol > 0 { arc_tip_point(prev_sweep) } else { CAP_START };
+    let p_new = if new_vol > 0 { arc_tip_point(new_sweep) } else { CAP_START };
+
+    let mut y_min = p_old.y.min(p_new.y) - cap_r;
+    let mut y_max = p_old.y.max(p_new.y) + cap_r;
+
+    // Include start cap row range when it changes colour.
+    if prev_vol == 0 || new_vol == 0 {
+        y_min = y_min.min(CAP_START.y - cap_r);
+        y_max = y_max.max(CAP_START.y + cap_r);
+    }
+
+    let lo = prev_sweep.min(new_sweep);
+    let hi = prev_sweep.max(new_sweep);
+
+    // Arc top (sweep = 135° → y = 10).
+    if lo <= 135.0 && hi >= 135.0 {
+        y_min = y_min.min(10 - cap_r);
+    }
+    // Arc left/right mid-points (sweep = 45° and 225° → y = 180).
+    for special in [45.0_f32, 225.0_f32] {
+        if lo <= special && hi >= special {
+            y_min = y_min.min(180 - cap_r);
+            y_max = y_max.max(180 + cap_r);
+        }
+    }
+
+    (y_min.max(0) as u16, y_max.min(359) as u16)
 }
 
 /// Show or clear a "MUTED" label just below the volume area (y=248).
@@ -116,16 +242,15 @@ fn draw_mute_indicator(display: &mut Sh8601, muted: bool) {
 }
 
 /// Full-screen "waiting for companion" state. Shown at boot and after the
-/// companion disconnects. Clears the screen and draws a small "NOT DETECTED"
-/// label at the top. The caller is expected to follow up with draw_volume so
-/// the standalone encoder value is visible in the centre.
+/// companion disconnects. Clears the screen and draws a "NOT DETECTED" label
+/// in the centre. The arc on the outer edge is drawn by the subsequent
+/// draw_volume call so the standalone encoder value is visible.
 fn draw_not_connected(display: &mut Sh8601) {
-    use u8g2_fonts::fonts::u8g2_font_profont15_tr;
     display.clear(Rgb565::BLACK).unwrap();
-    let font = FontRenderer::new::<u8g2_font_profont15_tr>();
+    let font = FontRenderer::new::<u8g2_font_helvR24_tr>();
     font.render_aligned(
         "NOT DETECTED",
-        Point::new(180, 35),
+        Point::new(180, 200),
         VerticalPosition::Baseline,
         HorizontalAlignment::Center,
         FontColor::Transparent(Rgb565::YELLOW),
@@ -221,9 +346,11 @@ fn draw_rx_stats(display: &mut Sh8601, stats: usb_serial::RxStats, tick: u32) {
     );
 }
 
-/// Draw a status label near the top of the screen (e.g. "TAP", "LONG PRESS").
+/// Draw a status label in the centre band (e.g. "MUTED", "LONG PRESS").
+/// Also clears the "NOT DETECTED" text that lives in the same region so
+/// passing an empty string cleanly erases any previous status.
 fn draw_status(display: &mut Sh8601, text: &str) {
-    Rectangle::new(Point::new(80, 5), Size::new(200, 34))
+    Rectangle::new(Point::new(30, 158), Size::new(300, 90))
         .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
         .draw(display)
         .unwrap();
@@ -231,7 +358,7 @@ fn draw_status(display: &mut Sh8601, text: &str) {
     let font = FontRenderer::new::<u8g2_font_helvR24_tr>();
     font.render_aligned(
         text,
-        Point::new(180, 35),
+        Point::new(180, 210),
         VerticalPosition::Baseline,
         HorizontalAlignment::Center,
         FontColor::Transparent(Rgb565::GREEN),
@@ -294,8 +421,9 @@ fn main() -> ! {
     display.flush().expect("Flush failed");
     info!("Screen drawn");
 
-    // Set up rotary encoder with software debounce (mirrors Waveshare C driver).
-    let mut encoder = Encoder::new(peripherals.GPIO8, peripherals.GPIO7);
+    // Set up rotary encoder — interrupt-driven, counts in GPIO ISR.
+    let mut io = Io::new(peripherals.IO_MUX);
+    let mut encoder = Encoder::new(peripherals.GPIO8, peripherals.GPIO7, &mut io);
     info!("Encoder ready - turn the knob");
 
     // Set up I2C bus shared by touch (CST816) and haptic (DRV2605)
@@ -322,6 +450,7 @@ fn main() -> ! {
 
     let delay = Delay::new();
     let mut last_count: i32 = 0;
+    let mut last_encoder_tick: u32 = 0;
     let mut needs_flush = false;
 
     // App-list state pushed by the host via SetAppList / SetSelectedApp.
@@ -343,25 +472,60 @@ fn main() -> ! {
     // screen. The companion sends heartbeat Pings every 5 s so this fires
     // roughly two missed heartbeats after a real disconnect.
     let mut last_host_msg_tick: u32 = 0;
+    // Debug overlay (RX stats) is off by default; hold finger for 4 s to toggle.
+    let mut debug_visible: bool = false;
+    // Counts consecutive ticks where the touch IRQ is asserted (finger held down).
+    let mut touch_held_ticks: u32 = 0;
     loop {
         loop_tick = loop_tick.wrapping_add(1);
         encoder.poll();
         let count = encoder.get();
         if count != last_count {
-            let delta = (count - last_count).clamp(-127, 127) as i8;
+            let raw_delta = count - last_count;
+            let delta = raw_delta.clamp(-127, 127) as i8;
+            last_encoder_tick = loop_tick;
+
             haptic.play(&mut i2c, Effect::SharpClick);
             if let Some(app_id) = selected_app {
                 let _ = usb.send(&DeviceToHost::VolumeDelta { app_id, delta });
             } else {
+                let prev_vol = standalone_value;
                 standalone_value = (standalone_value as i16 + delta as i16)
                     .clamp(0, 100) as u8;
-                draw_volume(&mut display, standalone_value);
-                needs_flush = true;
+                let (dy0, dy1) = draw_volume_delta(&mut display, prev_vol, standalone_value);
+                display.flush_rows(dy0, dy1).expect("Flush failed");
             }
             last_count = count;
         }
 
-        if let Some(event) = touch.read(&mut i2c) {
+        // Read touch registers every tick — this updates `finger_down` from
+        // `num_points` so the hold counter below has accurate presence data.
+        let touch_event = touch.read(&mut i2c);
+
+        // 4-second hold → toggle debug stats overlay.
+        // Uses `is_finger_down()` (num_points register) rather than the IRQ
+        // pin, which only pulses briefly and is already high by finger-lift.
+        if touch.is_finger_down() {
+            touch_held_ticks = touch_held_ticks.saturating_add(1);
+            if touch_held_ticks == 1_334 { // 1 334 ticks × 3 ms ≈ 4 s
+                debug_visible = !debug_visible;
+                // Full redraw so the stats band (which overlaps the volume arc)
+                // is cleanly removed or shown without any black bars.
+                if apps.is_empty() {
+                    draw_not_connected(&mut display);
+                    draw_volume(&mut display, standalone_value);
+                } else {
+                    display.clear(Rgb565::BLACK).unwrap();
+                    redraw_app(&mut display, &apps, selected_app, &current_icon, current_volume);
+                    draw_mute_indicator(&mut display, current_muted);
+                }
+                needs_flush = true;
+            }
+        } else {
+            touch_held_ticks = 0;
+        }
+
+        if let Some(event) = touch_event {
             if event.gesture != touch::Gesture::None {
                 info!("Touch: ({}, {}) gesture={:?}", event.x, event.y, event.gesture);
             }
@@ -479,9 +643,11 @@ fn main() -> ! {
                         app.volume = level;
                     }
                     if selected_app == Some(app_id) {
+                        let prev_vol = current_volume;
                         current_volume = level;
-                        draw_volume(&mut display, current_volume);
-                        needs_flush = true;
+                        let (dy0, dy1) = draw_volume_delta(&mut display, prev_vol, current_volume);
+                        display.flush_rows(dy0, dy1).expect("Flush failed");
+                        needs_flush = false;
                     }
                 }
                 HostToDevice::SetMute { app_id, muted } => {
@@ -519,17 +685,16 @@ fn main() -> ! {
             needs_flush = true;
         }
 
-        // Trigger a periodic flush every ~600 ms so the stats line stays live
-        // even when nothing else is changing.
-        if loop_tick % 200 == 0 {
+        // Trigger a periodic flush every ~600 ms so the stats line stays live.
+        if debug_visible && loop_tick % 200 == 0 {
             needs_flush = true;
         }
 
         if needs_flush {
-            // Always redraw stats right before pushing pixels so `t=`
-            // reflects the current loop tick, not a stale snapshot from the
-            // last heartbeat. The draw itself is cheap (framebuffer only).
-            draw_rx_stats(&mut display, usb.stats(), loop_tick);
+            if debug_visible {
+                // Redraw stats immediately before flush so `t=` is current.
+                draw_rx_stats(&mut display, usb.stats(), loop_tick);
+            }
             display.flush().expect("Flush failed");
             needs_flush = false;
         }

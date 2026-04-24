@@ -55,6 +55,9 @@ pub struct Cst816<'d> {
     irq: Input<'d>,
     _rst: Output<'d>,
     last_gesture: Gesture,
+    /// Updated on every `read()` call from the `num_points` register.
+    /// More reliable than the IRQ pin for detecting a sustained hold.
+    finger_down: bool,
 }
 
 impl<'d> Cst816<'d> {
@@ -88,12 +91,18 @@ impl<'d> Cst816<'d> {
         // Note: DoubleTap (0x0B) does not work on CST816D (chip ID 0xB6) despite
         // setting MotionMask bit 2. All other gestures work fine.
 
-        Self { irq, _rst: rst, last_gesture: Gesture::None }
+        Self { irq, _rst: rst, last_gesture: Gesture::None, finger_down: false }
     }
 
     /// Returns true if the touch IRQ pin is asserted (active LOW).
     pub fn is_touched(&self) -> bool {
         self.irq.is_low()
+    }
+
+    /// Returns true if a finger is currently on the screen, based on the
+    /// `num_points` register read during the last `read()` call.
+    pub fn is_finger_down(&self) -> bool {
+        self.finger_down
     }
 
     /// Poll for a touch event.
@@ -109,6 +118,10 @@ impl<'d> Cst816<'d> {
 
         let gesture = Gesture::from_id(buf[0]);
         let num_points = buf[1];
+
+        // Cache finger presence from the register — more reliable than the IRQ
+        // pin, which only pulses briefly and is high again by finger-lift time.
+        self.finger_down = num_points > 0 && num_points != 0xFF;
 
         // No finger and no gesture — nothing happening
         if num_points == 0 && gesture == Gesture::None {

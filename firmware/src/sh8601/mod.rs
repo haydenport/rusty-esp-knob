@@ -123,6 +123,41 @@ impl<'d> Sh8601<'d> {
         Ok(())
     }
 
+    /// Flush a horizontal band of rows to the display.
+    ///
+    /// Equivalent to `flush()` but limited to rows `y0..=y1`, reducing the
+    /// amount of data sent over QSPI when only a small region changed.
+    pub fn flush_rows(&mut self, y0: u16, y1: u16) -> Result<(), SpiError> {
+        let y1 = y1.min(board::DISPLAY_HEIGHT - 1);
+        if y0 > y1 {
+            return Ok(());
+        }
+
+        const ROW_BYTES: usize = board::DISPLAY_WIDTH as usize * 2;
+        const ROWS_PER_CHUNK: usize = 30_000 / ROW_BYTES;
+
+        let mut row = y0;
+        while row <= y1 {
+            let rows = (ROWS_PER_CHUNK as u16).min(y1 + 1 - row);
+            let bytes = rows as usize * ROW_BYTES;
+            let offset = row as usize * ROW_BYTES;
+
+            self.set_window(0, row, board::DISPLAY_WIDTH - 1, row + rows - 1)?;
+
+            let addr = (RAMWR as u32) << 8;
+            self.spi.half_duplex_write(
+                DataMode::Quad,
+                Command::_8Bit(CMD_WRITE_COLOR, DataMode::Single),
+                Address::_24Bit(addr, DataMode::Single),
+                0,
+                &self.framebuffer[offset..offset + bytes],
+            )?;
+
+            row += rows;
+        }
+        Ok(())
+    }
+
     /// Write a register command with parameter data (single-wire, opcode 0x02).
     fn write_register(&mut self, reg: u8, data: &[u8]) -> Result<(), SpiError> {
         let addr = (reg as u32) << 8;
