@@ -20,6 +20,14 @@ pub enum HostToDevice {
     SetVolume { app_id: u32, level: u8 },
     /// Set mute state for an app.
     SetMute { app_id: u32, muted: bool },
+    /// Configure backlight brightness and idle-dim/off timeouts.
+    /// `dim_after_secs` = 0 disables auto-dim; `off_after_secs` = 0 disables
+    /// auto-off (counted from the dim transition, not from last activity).
+    SetBacklight {
+        active_pct: u8,
+        dim_after_secs: u16,
+        off_after_secs: u16,
+    },
     /// Echo test — device replies with `Echo` containing the same payload.
     Echo(Vec<u8>),
 }
@@ -38,7 +46,8 @@ pub enum DeviceToHost {
     /// Touch gesture fired by the user.
     Gesture(GestureKind),
     /// Request the host to adjust the selected app's volume by a relative amount.
-    VolumeDelta { app_id: u32, delta: i8 },
+    /// `delta` is in encoder steps; the host scales by its sensitivity setting.
+    VolumeDelta { app_id: u32, delta: i16 },
     /// Notify the host that the user swiped to a different app.
     AppSelected(u32),
     /// Request the host to toggle mute on the given app.

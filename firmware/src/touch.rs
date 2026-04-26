@@ -52,7 +52,7 @@ pub struct TouchEvent {
 /// Does not own the I2C bus — pass `&mut I2c` to each method so the bus
 /// can be shared with other devices (DRV2605 haptic).
 pub struct Cst816<'d> {
-    irq: Input<'d>,
+    _irq: Input<'d>,
     _rst: Output<'d>,
     last_gesture: Gesture,
     /// Updated on every `read()` call from the `num_points` register.
@@ -91,12 +91,7 @@ impl<'d> Cst816<'d> {
         // Note: DoubleTap (0x0B) does not work on CST816D (chip ID 0xB6) despite
         // setting MotionMask bit 2. All other gestures work fine.
 
-        Self { irq, _rst: rst, last_gesture: Gesture::None, finger_down: false }
-    }
-
-    /// Returns true if the touch IRQ pin is asserted (active LOW).
-    pub fn is_touched(&self) -> bool {
-        self.irq.is_low()
+        Self { _irq: irq, _rst: rst, last_gesture: Gesture::None, finger_down: false }
     }
 
     /// Returns true if a finger is currently on the screen, based on the

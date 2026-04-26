@@ -17,6 +17,7 @@ Cargo workspace, three crates:
   - [src/encoder.rs](firmware/src/encoder.rs) — interrupt-driven rotary encoder with debounce.
   - [src/touch.rs](firmware/src/touch.rs) — CST816 touch over I2C.
   - [src/haptic.rs](firmware/src/haptic.rs) — DRV2605 haptic driver over I2C.
+  - [src/backlight.rs](firmware/src/backlight.rs) — LEDC PWM backlight + idle auto-dim/off state machine.
   - [src/usb_serial.rs](firmware/src/usb_serial.rs) — USB-Serial/JTAG transport.
 
 - [companion/](companion/) — Windows-only Rust binary (tray app + CLI subcommands).
@@ -66,4 +67,5 @@ Wire format: `COBS(postcard(message) || crc8) || 0x00`. The transport is the ESP
 - **Framebuffer in SRAM, not PSRAM.** DMA from PSRAM hit issues that weren't resolved; the 360x360x2 framebuffer fits in the 270KB internal heap.
 - **Boot Ready handshake.** Earlier builds had a ~5s startup window where the companion would send before the device was ready, producing COBS errors. Fixed via a Ready message at firmware boot — the companion waits for it before sending app data.
 - **Windows-only companion.** WASAPI + `tray-icon` are Windows. Cross-platform support would require swapping `audio.rs` and the tray backend.
-- **Project status.** Core feature set (encoder → volume, carousel, mute, tray, settings, Ready handshake) is shipped. Future ideas: peak/VU meter on display, per-app volume profiles.
+- **Backlight wake gating.** A touch that wakes the screen from the Off state is *swallowed* by [main.rs](firmware/src/main.rs) (via `Backlight::wake_from_off`) so a wake-tap doesn't also toggle mute. Encoder turns always wake AND act, since rotating a sleeping knob is unambiguously volume intent. Heartbeat `Ping` from the companion intentionally does NOT count as activity — otherwise the screen would never dim.
+- **Project status.** Core feature set (encoder → volume, carousel, mute, tray, settings, Ready handshake, PWM backlight) is shipped. Future ideas: peak/VU meter on display, per-app volume profiles.

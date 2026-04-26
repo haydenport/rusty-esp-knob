@@ -13,6 +13,8 @@ use protocol::codec::Decoder;
 use protocol::messages::{AppInfo, HostToDevice};
 use serialport::ClearBuffer;
 
+use crate::worker::BacklightShared;
+
 #[derive(Parser)]
 #[command(name = "companion", about = "Volume Knob PC companion")]
 struct Cli {
@@ -113,10 +115,15 @@ fn cmd_run(port_override: Option<String>) {
 
     let stop = Arc::new(AtomicBool::new(false));
     let sensitivity = Arc::new(AtomicU8::new(cfg.sensitivity_pct));
+    let backlight = Arc::new(BacklightShared::new(
+        cfg.backlight_pct,
+        cfg.backlight_dim_after_secs,
+        cfg.backlight_off_after_secs,
+    ));
     let (status_tx, _status_rx) = std::sync::mpsc::channel();
 
     // Run the event loop on the current thread (blocking until port error or Ctrl+C).
-    worker::run(&port_name, sensitivity, stop, status_tx);
+    worker::run(&port_name, sensitivity, backlight, stop, status_tx);
 }
 
 // ── List ─────────────────────────────────────────────────────────────────────

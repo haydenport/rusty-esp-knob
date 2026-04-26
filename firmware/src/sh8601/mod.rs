@@ -34,6 +34,16 @@ const COLMOD_RGB565: u8 = 0x55;
 /// Framebuffer size in bytes: 360 × 360 × 2 (RGB565).
 const FB_SIZE: usize = board::DISPLAY_WIDTH as usize * board::DISPLAY_HEIGHT as usize * 2;
 
+/// Bytes per display row (width × 2 for RGB565).
+const ROW_BYTES: usize = board::DISPLAY_WIDTH as usize * 2;
+
+/// Max bytes per QSPI write — must fit inside the DMA TX buffer configured
+/// in `main.rs` (see `dma_buffers!(_, 32_000)`).
+const CHUNK_SIZE: usize = 30_000;
+
+/// Whole rows per chunk (rounded down so each chunk ends on a row boundary).
+const ROWS_PER_CHUNK: usize = CHUNK_SIZE / ROW_BYTES;
+
 /// Display driver for the Waveshare ESP32-S3 Knob Touch LCD 1.8" QSPI AMOLED.
 ///
 /// Uses an in-memory framebuffer (heap-allocated). All drawing via
@@ -90,11 +100,6 @@ impl<'d> Sh8601<'d> {
 
         // Stream framebuffer in chunks sized to fit the DMA TX buffer.
         // Use per-chunk window rows instead of RAMWRC for reliability.
-        const CHUNK_SIZE: usize = 30_000;
-        const ROW_BYTES: usize = board::DISPLAY_WIDTH as usize * 2;
-        // Round chunk to whole rows
-        const ROWS_PER_CHUNK: usize = CHUNK_SIZE / ROW_BYTES;
-
         let mut row: u16 = 0;
         let mut offset = 0;
 
@@ -132,9 +137,6 @@ impl<'d> Sh8601<'d> {
         if y0 > y1 {
             return Ok(());
         }
-
-        const ROW_BYTES: usize = board::DISPLAY_WIDTH as usize * 2;
-        const ROWS_PER_CHUNK: usize = 30_000 / ROW_BYTES;
 
         let mut row = y0;
         while row <= y1 {

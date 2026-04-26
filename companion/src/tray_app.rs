@@ -6,7 +6,7 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::config::{self, Config};
-use crate::worker::{self, WorkerStatus};
+use crate::worker::{self, BacklightShared, WorkerStatus};
 
 /// Entry point for tray mode. Blocks until the user chooses Exit.
 pub fn run(port_name: String, cfg: Config) {
@@ -25,12 +25,18 @@ pub fn run(port_name: String, cfg: Config) {
     // Shared state between the tray event loop and the serial worker.
     let stop = Arc::new(AtomicBool::new(false));
     let sensitivity = Arc::new(AtomicU8::new(cfg.sensitivity_pct));
+    let backlight = Arc::new(BacklightShared::new(
+        cfg.backlight_pct,
+        cfg.backlight_dim_after_secs,
+        cfg.backlight_off_after_secs,
+    ));
     let (status_tx, status_rx) = mpsc::channel::<WorkerStatus>();
 
     let stop_worker = stop.clone();
     let sens_worker = sensitivity.clone();
+    let backlight_worker = backlight.clone();
     std::thread::spawn(move || {
-        worker::run(&port_name, sens_worker, stop_worker, status_tx);
+        worker::run(&port_name, sens_worker, backlight_worker, stop_worker, status_tx);
     });
 
     // Mutable local config copy for updating from menu events.
@@ -80,6 +86,12 @@ pub fn run(port_name: String, cfg: Config) {
                     set_sensitivity(&mut live_cfg, &sensitivity, &ids, 2);
                 } else if id == &ids.sens_5 {
                     set_sensitivity(&mut live_cfg, &sensitivity, &ids, 5);
+                } else if let Some(pct) = ids.brightness_choice(id) {
+                    set_brightness(&mut live_cfg, &backlight, &ids, pct);
+                } else if let Some(secs) = ids.dim_choice(id) {
+                    set_dim_after(&mut live_cfg, &backlight, &ids, secs);
+                } else if let Some(secs) = ids.off_choice(id) {
+                    set_off_after(&mut live_cfg, &backlight, &ids, secs);
                 }
             }
 
@@ -102,6 +114,51 @@ fn set_sensitivity(
     config::save(cfg);
 }
 
+fn set_brightness(
+    cfg: &mut Config,
+    backlight: &Arc<BacklightShared>,
+    ids: &MenuIds,
+    pct: u8,
+) {
+    cfg.backlight_pct = pct;
+    backlight.pct.store(pct, Ordering::Relaxed);
+    backlight.dirty.store(true, Ordering::Release);
+    for (item, val) in &ids.brightness_items {
+        item.set_checked(*val == pct);
+    }
+    config::save(cfg);
+}
+
+fn set_dim_after(
+    cfg: &mut Config,
+    backlight: &Arc<BacklightShared>,
+    ids: &MenuIds,
+    secs: u16,
+) {
+    cfg.backlight_dim_after_secs = secs;
+    backlight.dim_after_secs.store(secs, Ordering::Relaxed);
+    backlight.dirty.store(true, Ordering::Release);
+    for (item, val) in &ids.dim_items {
+        item.set_checked(*val == secs);
+    }
+    config::save(cfg);
+}
+
+fn set_off_after(
+    cfg: &mut Config,
+    backlight: &Arc<BacklightShared>,
+    ids: &MenuIds,
+    secs: u16,
+) {
+    cfg.backlight_off_after_secs = secs;
+    backlight.off_after_secs.store(secs, Ordering::Relaxed);
+    backlight.dirty.store(true, Ordering::Release);
+    for (item, val) in &ids.off_items {
+        item.set_checked(*val == secs);
+    }
+    config::save(cfg);
+}
+
 // ── Menu ─────────────────────────────────────────────────────────────────────
 
 struct MenuIds {
@@ -114,6 +171,33 @@ struct MenuIds {
     sens_1_item: CheckMenuItem,
     sens_2_item: CheckMenuItem,
     sens_5_item: CheckMenuItem,
+    /// `(item, brightness_pct)` pairs — first match wins.
+    brightness_items: Vec<(CheckMenuItem, u8)>,
+    /// `(item, dim_after_secs)` pairs. `0` = "Never".
+    dim_items: Vec<(CheckMenuItem, u16)>,
+    /// `(item, off_after_secs)` pairs. `0` = "Never".
+    off_items: Vec<(CheckMenuItem, u16)>,
+}
+
+impl MenuIds {
+    fn brightness_choice(&self, id: &tray_icon::menu::MenuId) -> Option<u8> {
+        self.brightness_items
+            .iter()
+            .find(|(item, _)| item.id() == id)
+            .map(|(_, v)| *v)
+    }
+    fn dim_choice(&self, id: &tray_icon::menu::MenuId) -> Option<u16> {
+        self.dim_items
+            .iter()
+            .find(|(item, _)| item.id() == id)
+            .map(|(_, v)| *v)
+    }
+    fn off_choice(&self, id: &tray_icon::menu::MenuId) -> Option<u16> {
+        self.off_items
+            .iter()
+            .find(|(item, _)| item.id() == id)
+            .map(|(_, v)| *v)
+    }
 }
 
 fn build_menu(cfg: &Config) -> (Menu, MenuIds) {
@@ -130,6 +214,61 @@ fn build_menu(cfg: &Config) -> (Menu, MenuIds) {
     let sens_sub = Submenu::with_items("Sensitivity", true, &[&sens_1, &sens_2, &sens_5])
         .expect("submenu");
     let _ = menu.append(&sens_sub);
+
+    // Backlight brightness submenu.
+    let brightness_choices: [u8; 4] = [25, 50, 75, 100];
+    let brightness_items: Vec<(CheckMenuItem, u8)> = brightness_choices
+        .iter()
+        .map(|&p| {
+            let label = format!("{p}%");
+            (CheckMenuItem::new(&label, true, cfg.backlight_pct == p, None), p)
+        })
+        .collect();
+    let brightness_refs: Vec<&dyn tray_icon::menu::IsMenuItem> =
+        brightness_items.iter().map(|(i, _)| i as &dyn tray_icon::menu::IsMenuItem).collect();
+    let brightness_sub = Submenu::with_items("Brightness", true, &brightness_refs)
+        .expect("brightness submenu");
+    let _ = menu.append(&brightness_sub);
+
+    // Dim-after submenu.
+    let dim_choices: [(u16, &str); 5] = [
+        (10, "10 s"),
+        (30, "30 s"),
+        (60, "1 min"),
+        (180, "3 min"),
+        (0, "Never"),
+    ];
+    let dim_items: Vec<(CheckMenuItem, u16)> = dim_choices
+        .iter()
+        .map(|(s, lbl)| {
+            (CheckMenuItem::new(*lbl, true, cfg.backlight_dim_after_secs == *s, None), *s)
+        })
+        .collect();
+    let dim_refs: Vec<&dyn tray_icon::menu::IsMenuItem> =
+        dim_items.iter().map(|(i, _)| i as &dyn tray_icon::menu::IsMenuItem).collect();
+    let dim_sub = Submenu::with_items("Dim after", true, &dim_refs)
+        .expect("dim submenu");
+    let _ = menu.append(&dim_sub);
+
+    // Off-after submenu (counted from the dim transition, not last activity).
+    let off_choices: [(u16, &str); 5] = [
+        (30, "30 s"),
+        (90, "90 s"),
+        (300, "5 min"),
+        (600, "10 min"),
+        (0, "Never"),
+    ];
+    let off_items: Vec<(CheckMenuItem, u16)> = off_choices
+        .iter()
+        .map(|(s, lbl)| {
+            (CheckMenuItem::new(*lbl, true, cfg.backlight_off_after_secs == *s, None), *s)
+        })
+        .collect();
+    let off_refs: Vec<&dyn tray_icon::menu::IsMenuItem> =
+        off_items.iter().map(|(i, _)| i as &dyn tray_icon::menu::IsMenuItem).collect();
+    let off_sub = Submenu::with_items("Off after dim", true, &off_refs)
+        .expect("off submenu");
+    let _ = menu.append(&off_sub);
 
     let autostart = CheckMenuItem::new("Auto-start on login", true, cfg.autostart, None);
     let _ = menu.append(&autostart);
@@ -149,6 +288,9 @@ fn build_menu(cfg: &Config) -> (Menu, MenuIds) {
         sens_1_item: sens_1,
         sens_2_item: sens_2,
         sens_5_item: sens_5,
+        brightness_items,
+        dim_items,
+        off_items,
     };
 
     (menu, ids)

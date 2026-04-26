@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,35 @@ pub enum WorkerStatus {
     Error(String),
 }
 
+/// Shared backlight settings. The tray writes via the setters; the worker
+/// pushes a `SetBacklight` to the device whenever `dirty` is set.
+pub struct BacklightShared {
+    pub pct: AtomicU8,
+    pub dim_after_secs: AtomicU16,
+    pub off_after_secs: AtomicU16,
+    pub dirty: AtomicBool,
+}
+
+impl BacklightShared {
+    pub fn new(pct: u8, dim_after_secs: u16, off_after_secs: u16) -> Self {
+        Self {
+            pct: AtomicU8::new(pct),
+            dim_after_secs: AtomicU16::new(dim_after_secs),
+            off_after_secs: AtomicU16::new(off_after_secs),
+            // Push once on connect.
+            dirty: AtomicBool::new(true),
+        }
+    }
+
+    pub fn snapshot(&self) -> HostToDevice {
+        HostToDevice::SetBacklight {
+            active_pct: self.pct.load(Ordering::Relaxed),
+            dim_after_secs: self.dim_after_secs.load(Ordering::Relaxed),
+            off_after_secs: self.off_after_secs.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Open `port_name`, run the full init sequence (including Ready handshake),
 /// then loop processing encoder/gesture events until `stop` is set.
 ///
@@ -24,6 +53,7 @@ pub enum WorkerStatus {
 pub fn run(
     port_name: &str,
     sensitivity: Arc<AtomicU8>,
+    backlight: Arc<BacklightShared>,
     stop: Arc<AtomicBool>,
     status_tx: std::sync::mpsc::Sender<WorkerStatus>,
 ) {
@@ -220,6 +250,12 @@ pub fn run(
         if last_heartbeat.elapsed() >= Duration::from_secs(5) {
             last_heartbeat = Instant::now();
             send(&mut *port, &HostToDevice::Ping);
+        }
+
+        // Push backlight settings if the tray changed them (or on first run
+        // after connect, since `dirty` starts true).
+        if backlight.dirty.swap(false, Ordering::AcqRel) {
+            send(&mut *port, &backlight.snapshot());
         }
 
         // Periodically re-enumerate audio sessions so newly-launched apps appear.

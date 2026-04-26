@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod backlight;
 mod board;
 mod encoder;
 mod haptic;
@@ -17,6 +18,7 @@ use esp_hal::delay::Delay;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
 use esp_hal::dma_buffers;
 use esp_hal::gpio::{Io, Level, Output, OutputConfig};
+use backlight::Backlight;
 use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::main;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
@@ -88,8 +90,6 @@ fn draw_volume(display: &mut Sh8601, volume: u8) {
     const STROKE: u32 = 14;
     const START_DEG: f32 = 135.0; // 7:30 o'clock (lower-left)
     const SWEEP_DEG: f32 = 270.0; // ends at 4:30 o'clock (lower-right)
-    // Arc path radius (= DIAMETER/2 = 170). Used for cap centre maths.
-    const ARC_R: f32 = 170.0;
 
     // Pre-computed cap centres for the fixed track endpoints.
     // 135°: x = 180 + 170*cos(135°) = 180 - 120.2 ≈ 60, y = 180 + 170*sin(135°) ≈ 300
@@ -122,10 +122,7 @@ fn draw_volume(display: &mut Sh8601, volume: u8) {
         draw_arc_cap(display, CAP_START, STROKE, Rgb565::WHITE);
 
         // White cap at fill tip — position computed at runtime from the sweep angle.
-        let tip_rad = (START_DEG + fill_sweep) * (core::f32::consts::PI / 180.0);
-        let tx = 180 + (ARC_R * libm::cosf(tip_rad)) as i32;
-        let ty = 180 + (ARC_R * libm::sinf(tip_rad)) as i32;
-        draw_arc_cap(display, Point::new(tx, ty), STROKE, Rgb565::WHITE);
+        draw_arc_cap(display, arc_tip_point(fill_sweep), STROKE, Rgb565::WHITE);
     }
 }
 
@@ -382,8 +379,9 @@ fn main() -> ! {
 
     info!("Volume Knob Controller - firmware starting");
 
-    // Backlight on
-    let _backlight = Output::new(peripherals.GPIO47, Level::High, OutputConfig::default());
+    // PWM backlight with idle auto-dim/off. Driven from the main loop via
+    // notify_activity() on user input and host-driven volume/mute changes.
+    let mut backlight = Backlight::new(peripherals.LEDC, peripherals.GPIO47);
 
     // Display reset pin
     let rst = Output::new(peripherals.GPIO21, Level::High, OutputConfig::default());
@@ -482,8 +480,9 @@ fn main() -> ! {
         let count = encoder.get();
         if count != last_count {
             let raw_delta = count - last_count;
-            let delta = raw_delta.clamp(-127, 127) as i8;
+            let delta = raw_delta.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             last_encoder_tick = loop_tick;
+            backlight.notify_activity(loop_tick);
 
             haptic.play(&mut i2c, Effect::SharpClick);
             if let Some(app_id) = selected_app {
@@ -506,6 +505,8 @@ fn main() -> ! {
         // Uses `is_finger_down()` (num_points register) rather than the IRQ
         // pin, which only pulses briefly and is already high by finger-lift.
         if touch.is_finger_down() {
+            // Treat sustained contact as activity so a long-press doesn't dim.
+            backlight.notify_activity(loop_tick);
             touch_held_ticks = touch_held_ticks.saturating_add(1);
             if touch_held_ticks == 1_334 { // 1 334 ticks × 3 ms ≈ 4 s
                 debug_visible = !debug_visible;
@@ -529,6 +530,12 @@ fn main() -> ! {
             if event.gesture != touch::Gesture::None {
                 info!("Touch: ({}, {}) gesture={:?}", event.x, event.y, event.gesture);
             }
+            // If the screen was fully off, the first touch only wakes it —
+            // don't fire the gesture (otherwise a wake-tap would also toggle
+            // mute on whatever app happened to be selected).
+            if backlight.wake_from_off(loop_tick) {
+                continue;
+            }
             match event.gesture {
                 touch::Gesture::SingleTap => {
                     // Tap toggles mute for the selected app. Companion will
@@ -551,7 +558,11 @@ fn main() -> ! {
                         selected_app = Some(app.id);
                         current_volume = app.volume;
                         current_muted = app.muted;
-                        current_icon.clear();
+                        // Drop the old icon's heap capacity (not just its
+                        // contents) — the next SetAppIcon will allocate ~8 KB
+                        // for the new pixels while still reading bytes into
+                        // the decoder buffer, so we need the headroom.
+                        current_icon = Vec::new();
                         haptic.play(&mut i2c, Effect::SharpClick);
                         redraw_app(&mut display, &apps, selected_app, &[], current_volume);
                         draw_mute_indicator(&mut display, current_muted);
@@ -566,7 +577,11 @@ fn main() -> ! {
                         selected_app = Some(app.id);
                         current_volume = app.volume;
                         current_muted = app.muted;
-                        current_icon.clear();
+                        // Drop the old icon's heap capacity (not just its
+                        // contents) — the next SetAppIcon will allocate ~8 KB
+                        // for the new pixels while still reading bytes into
+                        // the decoder buffer, so we need the headroom.
+                        current_icon = Vec::new();
                         haptic.play(&mut i2c, Effect::SharpClick);
                         redraw_app(&mut display, &apps, selected_app, &[], current_volume);
                         draw_mute_indicator(&mut display, current_muted);
@@ -600,7 +615,12 @@ fn main() -> ! {
                     ack = false; // Echo reply replaces the ack.
                     let _ = usb.send(&DeviceToHost::Echo(data));
                 }
+                HostToDevice::SetBacklight { active_pct, dim_after_secs, off_after_secs } => {
+                    backlight.set_active_pct(active_pct);
+                    backlight.set_timeouts(dim_after_secs, off_after_secs);
+                }
                 HostToDevice::SetAppList(list) => {
+                    backlight.notify_activity(loop_tick);
                     apps = list;
                     if selected_app.is_none() {
                         selected_app = apps.first().map(|a| a.id);
@@ -626,9 +646,11 @@ fn main() -> ! {
                     }
                 }
                 HostToDevice::SetSelectedApp(id) => {
+                    backlight.notify_activity(loop_tick);
                     selected_app = Some(id);
                     selected_idx = apps.iter().position(|a| a.id == id).unwrap_or(0);
-                    current_icon.clear();
+                    // Free old icon capacity — see swipe handler for why.
+                    current_icon = Vec::new();
                     if let Some(app) = apps.iter().find(|a| a.id == id) {
                         current_volume = app.volume;
                         current_muted = app.muted;
@@ -638,6 +660,8 @@ fn main() -> ! {
                     needs_flush = true;
                 }
                 HostToDevice::SetVolume { app_id, level } => {
+                    // OS-mixer or other-app volume change is user activity too.
+                    backlight.notify_activity(loop_tick);
                     // Update the local app list so stale volumes aren't shown after a swipe.
                     if let Some(app) = apps.iter_mut().find(|a| a.id == app_id) {
                         app.volume = level;
@@ -651,6 +675,7 @@ fn main() -> ! {
                     }
                 }
                 HostToDevice::SetMute { app_id, muted } => {
+                    backlight.notify_activity(loop_tick);
                     if let Some(app) = apps.iter_mut().find(|a| a.id == app_id) {
                         app.muted = muted;
                     }
@@ -661,7 +686,6 @@ fn main() -> ! {
                         needs_flush = true;
                     }
                 }
-                _ => {}
             }
             // Flush now so the host sees `Ack` only after the display work
             // for this message is actually done.
@@ -698,6 +722,8 @@ fn main() -> ! {
             display.flush().expect("Flush failed");
             needs_flush = false;
         }
+
+        backlight.tick(loop_tick);
 
         delay.delay_millis(3);
     }

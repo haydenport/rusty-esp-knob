@@ -9,8 +9,13 @@ use esp_hal::Blocking;
 use protocol::codec::{self, Decoder};
 use protocol::messages::{DeviceToHost, HostToDevice};
 
-/// Bounded read buffer. Sized to fit a 64×64 RGB565 icon frame (~8 KB of pixel
-/// data plus postcard/COBS/CRC overhead).
+/// Upper bound on a single decoded frame, in bytes.
+///
+/// Sized for a 64×64 RGB565 icon (≈ 8 KB pixels + postcard/COBS/CRC
+/// overhead). The Decoder allocates this much up-front via `Vec::with_capacity`,
+/// so it's a fixed steady-state cost. Don't raise without recalculating peak
+/// heap during a SetAppIcon swap (decoder + old icon capacity + incoming
+/// pixels Vec): we only have ~37 KB free after the framebuffer.
 const MAX_FRAME_LEN: usize = 12 * 1024;
 
 /// Diagnostic counters — displayed on screen so we can see what the transport
@@ -27,10 +32,15 @@ pub struct RxStats {
     pub tx_drop: u32,
 }
 
+/// Per-`poll()` read budget. Larger = fewer iterations to drain a big icon
+/// push (8 KB icon takes ~16 polls at 512 B vs ~64 at 128 B), but each poll
+/// still completes well under 1 ms of work so the main loop stays responsive.
+const SCRATCH_LEN: usize = 512;
+
 pub struct UsbSerial<'d> {
     jtag: UsbSerialJtag<'d, Blocking>,
     decoder: Decoder,
-    scratch: [u8; 128],
+    scratch: [u8; SCRATCH_LEN],
     stats: RxStats,
 }
 
@@ -39,7 +49,7 @@ impl<'d> UsbSerial<'d> {
         Self {
             jtag,
             decoder: Decoder::new(MAX_FRAME_LEN),
-            scratch: [0; 128],
+            scratch: [0; SCRATCH_LEN],
             stats: RxStats::default(),
         }
     }

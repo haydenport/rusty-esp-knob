@@ -16,10 +16,29 @@ pub struct Config {
     /// Register this executable for Windows auto-start on login.
     #[serde(default)]
     pub autostart: bool,
+    /// Active backlight brightness (1–100).
+    #[serde(default = "default_backlight_pct")]
+    pub backlight_pct: u8,
+    /// Idle seconds before the backlight dims. 0 disables.
+    #[serde(default = "default_dim_after_secs")]
+    pub backlight_dim_after_secs: u16,
+    /// Additional idle seconds (after dimming) before the backlight switches
+    /// off. 0 disables — the screen stays at the dim level forever.
+    #[serde(default = "default_off_after_secs")]
+    pub backlight_off_after_secs: u16,
 }
 
 fn default_sensitivity() -> u8 {
     2
+}
+fn default_backlight_pct() -> u8 {
+    100
+}
+fn default_dim_after_secs() -> u16 {
+    30
+}
+fn default_off_after_secs() -> u16 {
+    90
 }
 
 impl Default for Config {
@@ -28,6 +47,9 @@ impl Default for Config {
             port: String::new(),
             sensitivity_pct: 2,
             autostart: false,
+            backlight_pct: default_backlight_pct(),
+            backlight_dim_after_secs: default_dim_after_secs(),
+            backlight_off_after_secs: default_off_after_secs(),
         }
     }
 }
