@@ -97,6 +97,29 @@ fn draw_volume(display: &mut Sh8601, volume: u8) {
     // 405°=45°: x = 180 + 170*cos(45°) ≈ 300, y ≈ 300
     const CAP_END: Point = Point::new(300, 300);
 
+    // Wipe the bar's annular footprint to black before drawing. The Arc and
+    // Circle primitives in embedded-graphics each make slightly different
+    // edge-pixel decisions (different center_2x, different inclusion paths
+    // through PlaneSector for Intersection vs Union sweeps), so a stale
+    // white pixel from a previous frame can survive both the gray arc's
+    // overdraw and the new white arc's overdraw — appearing as a bright
+    // sliver along the inner edge. Wiping with a wider stroke than the
+    // visible bar guarantees nothing from the prior frame survives.
+    //
+    // Wipe stroke 32 covers radii 154–186 (centerline 170 ± 16), which
+    // brackets the bar's 163–177 range plus the cap circles that extend
+    // ~7 px past the centerline at the tip.
+    Arc::new(TOP_LEFT, DIAMETER, Angle::from_degrees(START_DEG), Angle::from_degrees(SWEEP_DEG))
+        .into_styled(PrimitiveStyle::with_stroke(Rgb565::BLACK, 32))
+        .draw(display)
+        .unwrap();
+    // Wipe also covers the cap circles' bounding regions at the fixed
+    // endpoints — they sit at the start/end of the 270° sweep, but the
+    // Arc primitive's inclusion test may not reach the very corners of
+    // those cap pixels at the angular boundaries.
+    draw_arc_cap(display, CAP_START, 32, Rgb565::BLACK);
+    draw_arc_cap(display, CAP_END, 32, Rgb565::BLACK);
+
     // Full track in dim gray, then round caps at both track endpoints.
     Arc::new(TOP_LEFT, DIAMETER, Angle::from_degrees(START_DEG), Angle::from_degrees(SWEEP_DEG))
         .into_styled(PrimitiveStyle::with_stroke(Rgb565::CSS_DIM_GRAY, STROKE))
@@ -145,63 +168,34 @@ fn arc_tip_point(sweep_deg: f32) -> Point {
     )
 }
 
-/// Incremental arc update: only redraws the segment that changed between
-/// `prev_vol` and `new_vol`, then returns the dirty `(y0, y1)` row range
-/// suitable for passing to `display.flush_rows`.
+/// Redraw the whole volume bar into the framebuffer and return the `(y0, y1)`
+/// row range that actually changed, suitable for passing to `display.flush_rows`.
 ///
-/// Much faster than `draw_volume` for small encoder steps because only
-/// the changed arc segment (a few degrees) is rendered, and only those
-/// rows need to be sent over QSPI.
+/// We always redraw the full bar (not just the angular delta) because the arc
+/// rasterizer in embedded-graphics makes slightly different inner-edge pixel
+/// decisions for `Arc(start, sweep)` calls with different parameters covering
+/// the same physical angle range. Painting only a small "vacated" segment in
+/// gray would leave 1–2 px white slivers along the inner edge that the gray
+/// arc didn't claim — visible as bright ragged spots after rotating up then
+/// back down. Full redraw keeps the framebuffer self-consistent; the partial
+/// flush is what makes this cheap.
 fn draw_volume_delta(display: &mut Sh8601, prev_vol: u8, new_vol: u8) -> (u16, u16) {
     if prev_vol == new_vol {
         return (0, 0);
     }
 
-    const TOP_LEFT: Point = Point::new(10, 10);
-    const DIAMETER: u32 = 340;
     const STROKE: u32 = 14;
     const FULL_SWEEP: f32 = 270.0;
     const CAP_START: Point = Point::new(60, 300);
 
+    draw_volume(display, new_vol);
+
+    // Compute dirty row bounds. The framebuffer is now consistent everywhere,
+    // but only rows touching the changed angular range differ from the previous
+    // frame, so we flush just those.
     let prev_sweep = FULL_SWEEP * (prev_vol as f32 / 100.0);
     let new_sweep  = FULL_SWEEP * (new_vol  as f32 / 100.0);
 
-    if new_vol > prev_vol {
-        // Fill the newly covered segment in white.
-        let delta = new_sweep - prev_sweep;
-        Arc::new(TOP_LEFT, DIAMETER,
-            Angle::from_degrees(135.0 + prev_sweep),
-            Angle::from_degrees(delta))
-            .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, STROKE))
-            .draw(display).unwrap();
-        // Start cap becomes white when transitioning from vol=0.
-        if prev_vol == 0 {
-            draw_arc_cap(display, CAP_START, STROKE, Rgb565::WHITE);
-        }
-        // Advance tip cap to new position.
-        draw_arc_cap(display, arc_tip_point(new_sweep), STROKE, Rgb565::WHITE);
-    } else {
-        // Revert the newly vacated segment back to dim gray.
-        let delta = prev_sweep - new_sweep;
-        Arc::new(TOP_LEFT, DIAMETER,
-            Angle::from_degrees(135.0 + new_sweep),
-            Angle::from_degrees(delta))
-            .into_styled(PrimitiveStyle::with_stroke(Rgb565::CSS_DIM_GRAY, STROKE))
-            .draw(display).unwrap();
-        // Erase the old (white) tip cap.
-        if prev_vol > 0 {
-            draw_arc_cap(display, arc_tip_point(prev_sweep), STROKE, Rgb565::CSS_DIM_GRAY);
-        }
-        // Draw new tip cap, or restore gray start cap when vol hits 0.
-        if new_vol > 0 {
-            draw_arc_cap(display, arc_tip_point(new_sweep), STROKE, Rgb565::WHITE);
-        } else {
-            draw_arc_cap(display, CAP_START, STROKE, Rgb565::CSS_DIM_GRAY);
-        }
-    }
-
-    // Compute dirty row bounds including both cap positions and any arc extremes
-    // the segment may cross.
     let cap_r = (STROKE / 2 + 1) as i32;
     let p_old = if prev_vol > 0 { arc_tip_point(prev_sweep) } else { CAP_START };
     let p_new = if new_vol > 0 { arc_tip_point(new_sweep) } else { CAP_START };
@@ -484,7 +478,6 @@ fn main() -> ! {
             last_encoder_tick = loop_tick;
             backlight.notify_activity(loop_tick);
 
-            haptic.play(&mut i2c, Effect::SharpClick);
             if let Some(app_id) = selected_app {
                 let _ = usb.send(&DeviceToHost::VolumeDelta { app_id, delta });
             } else {
@@ -497,9 +490,14 @@ fn main() -> ! {
             last_count = count;
         }
 
-        // Read touch registers every tick — this updates `finger_down` from
-        // `num_points` so the hold counter below has accurate presence data.
-        let touch_event = touch.read(&mut i2c);
+        // Only read touch registers when the IRQ pin is asserted or a finger
+        // was already down. Tap/long-press gestures fire at finger-lift when
+        // IRQ is already high, so the `is_finger_down()` arm catches those.
+        let touch_event = if touch.irq_asserted() || touch.is_finger_down() {
+            touch.read(&mut i2c)
+        } else {
+            None
+        };
 
         // 4-second hold → toggle debug stats overlay.
         // Uses `is_finger_down()` (num_points register) rather than the IRQ
@@ -725,6 +723,6 @@ fn main() -> ! {
 
         backlight.tick(loop_tick);
 
-        delay.delay_millis(3);
+        delay.delay_millis(1);
     }
 }
