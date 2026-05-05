@@ -160,6 +160,196 @@ impl<'d> Sh8601<'d> {
         Ok(())
     }
 
+    /// Fill the full 360° annular ring [inner_r, outer_r] at center (cx, cy).
+    ///
+    /// No angular check — faster than a 270° arc wipe and ensures the cap
+    /// circles at the arc tips (which straddle the angular boundaries) are
+    /// fully cleared along with the rest of the band.
+    pub fn fill_ring(
+        &mut self,
+        cx: i32, cy: i32,
+        inner_r: i32, outer_r: i32,
+        color: Rgb565,
+    ) {
+        let raw = RawU16::from(color).into_inner();
+        let hi = (raw >> 8) as u8;
+        let lo = (raw & 0xFF) as u8;
+        let w = board::DISPLAY_WIDTH as i32;
+        let h = board::DISPLAY_HEIGHT as i32;
+        let inner_r2 = inner_r * inner_r;
+        let outer_r2 = outer_r * outer_r;
+
+        for dy in -outer_r..=outer_r {
+            let dy2 = dy * dy;
+            if dy2 > outer_r2 { continue; }
+            let y = cy + dy;
+            if y < 0 || y >= h { continue; }
+            let base = y as usize * ROW_BYTES;
+
+            let x_outer = libm::sqrtf((outer_r2 - dy2) as f32) as i32;
+
+            if dy2 >= inner_r2 {
+                let x0 = (cx - x_outer).max(0) as usize;
+                let x1 = (cx + x_outer).min(w - 1) as usize;
+                for x in x0..=x1 {
+                    self.framebuffer[base + x * 2] = hi;
+                    self.framebuffer[base + x * 2 + 1] = lo;
+                }
+            } else {
+                let x_inner = libm::sqrtf((inner_r2 - dy2) as f32) as i32;
+                let lx0 = (cx - x_outer).max(0) as usize;
+                let lx1 = (cx - x_inner).min(w - 1) as usize;
+                let rx0 = (cx + x_inner).max(0) as usize;
+                let rx1 = (cx + x_outer).min(w - 1) as usize;
+                for x in lx0..=lx1 {
+                    self.framebuffer[base + x * 2] = hi;
+                    self.framebuffer[base + x * 2 + 1] = lo;
+                }
+                for x in rx0..=rx1 {
+                    self.framebuffer[base + x * 2] = hi;
+                    self.framebuffer[base + x * 2 + 1] = lo;
+                }
+            }
+        }
+    }
+
+    /// Fill the 270° arc ring (start=135°, gap at bottom between 45°–135°).
+    ///
+    /// Angle test: exclude pixels where `dy > dx.abs()` (the excluded wedge
+    /// around 6-o'clock). This is an exact integer check — no trigonometry.
+    pub fn fill_ring_270(
+        &mut self,
+        cx: i32, cy: i32,
+        inner_r: i32, outer_r: i32,
+        color: Rgb565,
+    ) {
+        let raw = RawU16::from(color).into_inner();
+        let hi = (raw >> 8) as u8;
+        let lo = (raw & 0xFF) as u8;
+        let w = board::DISPLAY_WIDTH as i32;
+        let h = board::DISPLAY_HEIGHT as i32;
+        let inner_r2 = inner_r * inner_r;
+        let outer_r2 = outer_r * outer_r;
+
+        for dy in -outer_r..=outer_r {
+            let dy2 = dy * dy;
+            if dy2 > outer_r2 { continue; }
+            let y = cy + dy;
+            if y < 0 || y >= h { continue; }
+            let base = y as usize * ROW_BYTES;
+
+            let x_outer = libm::sqrtf((outer_r2 - dy2) as f32) as i32;
+
+            // Row-level skip: if every pixel on this row is inside the excluded
+            // bottom wedge (max |dx| = x_outer < dy), skip the whole row.
+            if dy > x_outer { continue; }
+
+            if dy2 >= inner_r2 {
+                let x0 = (cx - x_outer).max(0);
+                let x1 = (cx + x_outer).min(w - 1);
+                for xi in x0..=x1 {
+                    let dx = xi - cx;
+                    if dy > dx.abs() { continue; }
+                    let x = xi as usize;
+                    self.framebuffer[base + x * 2] = hi;
+                    self.framebuffer[base + x * 2 + 1] = lo;
+                }
+            } else {
+                let x_inner = libm::sqrtf((inner_r2 - dy2) as f32) as i32;
+                for &(x0, x1) in &[
+                    ((cx - x_outer).max(0), (cx - x_inner).min(w - 1)),
+                    ((cx + x_inner).max(0), (cx + x_outer).min(w - 1)),
+                ] {
+                    for xi in x0..=x1 {
+                        let dx = xi - cx;
+                        if dy > dx.abs() { continue; }
+                        let x = xi as usize;
+                        self.framebuffer[base + x * 2] = hi;
+                        self.framebuffer[base + x * 2 + 1] = lo;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fill a partial arc [135°, 135°+sweep_deg] of the ring [inner_r, outer_r].
+    ///
+    /// Used for the white volume-fill portion. Uses two cross-product half-plane
+    /// tests (precomputed per call, integer+float per pixel — no atan2).
+    /// For sweep_deg ≤ 180° uses AND logic; > 180° uses OR logic to handle
+    /// the case where the fill arc wraps past the 180° half-plane boundary.
+    pub fn fill_ring_arc(
+        &mut self,
+        cx: i32, cy: i32,
+        inner_r: i32, outer_r: i32,
+        sweep_deg: f32,
+        color: Rgb565,
+    ) {
+        let raw = RawU16::from(color).into_inner();
+        let hi = (raw >> 8) as u8;
+        let lo = (raw & 0xFF) as u8;
+        let w = board::DISPLAY_WIDTH as i32;
+        let h = board::DISPLAY_HEIGHT as i32;
+        let inner_r2 = inner_r * inner_r;
+        let outer_r2 = outer_r * outer_r;
+
+        // Precompute end direction B = (cos(135°+sweep°), sin(135°+sweep°)).
+        let end_rad = (135.0_f32 + sweep_deg) * core::f32::consts::PI / 180.0;
+        let bx = libm::cosf(end_rad);
+        let by = libm::sinf(end_rad);
+        let use_or = sweep_deg > 180.0;
+
+        for dy in -outer_r..=outer_r {
+            let dy2 = dy * dy;
+            if dy2 > outer_r2 { continue; }
+            let y = cy + dy;
+            if y < 0 || y >= h { continue; }
+            let base = y as usize * ROW_BYTES;
+            let dy_f = dy as f32;
+
+            let x_outer = libm::sqrtf((outer_r2 - dy2) as f32) as i32;
+
+            if dy2 >= inner_r2 {
+                let x0 = (cx - x_outer).max(0);
+                let x1 = (cx + x_outer).min(w - 1);
+                for xi in x0..=x1 {
+                    let dx = xi - cx;
+                    // Start check: cross(A=(cos135°,sin135°), P) >= 0
+                    // ⟺ -(dx+dy)/√2 >= 0 ⟺ dx+dy <= 0
+                    let after_start = dx + dy <= 0;
+                    // End check: cross(P, B) >= 0 ⟺ dx*by - dy*bx >= 0
+                    let before_end = dx as f32 * by - dy_f * bx >= 0.0;
+                    let in_fill = if use_or { after_start || before_end }
+                                  else      { after_start && before_end };
+                    if in_fill {
+                        let x = xi as usize;
+                        self.framebuffer[base + x * 2] = hi;
+                        self.framebuffer[base + x * 2 + 1] = lo;
+                    }
+                }
+            } else {
+                let x_inner = libm::sqrtf((inner_r2 - dy2) as f32) as i32;
+                for &(x0, x1) in &[
+                    ((cx - x_outer).max(0), (cx - x_inner).min(w - 1)),
+                    ((cx + x_inner).max(0), (cx + x_outer).min(w - 1)),
+                ] {
+                    for xi in x0..=x1 {
+                        let dx = xi - cx;
+                        let after_start = dx + dy <= 0;
+                        let before_end = dx as f32 * by - dy_f * bx >= 0.0;
+                        let in_fill = if use_or { after_start || before_end }
+                                      else      { after_start && before_end };
+                        if in_fill {
+                            let x = xi as usize;
+                            self.framebuffer[base + x * 2] = hi;
+                            self.framebuffer[base + x * 2 + 1] = lo;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Write a register command with parameter data (single-wire, opcode 0x02).
     fn write_register(&mut self, reg: u8, data: &[u8]) -> Result<(), SpiError> {
         let addr = (reg as u32) << 8;

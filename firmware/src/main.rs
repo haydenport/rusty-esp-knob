@@ -30,7 +30,7 @@ use protocol::messages::{DeviceToHost, GestureKind, HostToDevice, PROTOCOL_VERSI
 
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{Arc, Circle, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, StrokeAlignment};
+use embedded_graphics::primitives::{Circle, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, StrokeAlignment};
 use u8g2_fonts::FontRenderer;
 use u8g2_fonts::fonts::u8g2_font_helvR24_tr;
 use u8g2_fonts::types::{FontColor, HorizontalAlignment, VerticalPosition};
@@ -82,69 +82,38 @@ fn to_wire_gesture(g: touch::Gesture) -> Option<GestureKind> {
 /// A 270° track (lower-left → over the top → lower-right) is drawn in dim gray;
 /// the filled portion grows clockwise from lower-left proportional to volume.
 /// Filled circles are placed at each cap to give a rounded end-cap appearance.
+///
+/// Rasterization uses direct scanline writes rather than the embedded-graphics
+/// Arc primitive. Arc iterates the full 340×340 bounding box per call; the
+/// scanline approach visits only pixels within the annular band (~11 K pixels
+/// for the track stroke), cutting per-call time from ~7 ms to <1 ms.
 fn draw_volume(display: &mut Sh8601, volume: u8) {
-    // Arc center = (180, 180). top_left = center - radius = (10, 10), diameter = 340.
-    // Stroke 14 px → cap circles have the same diameter so they blend seamlessly.
-    const TOP_LEFT: Point = Point::new(10, 10);
-    const DIAMETER: u32 = 340;
+    const CX: i32 = 180;
+    const CY: i32 = 180;
     const STROKE: u32 = 14;
-    const START_DEG: f32 = 135.0; // 7:30 o'clock (lower-left)
-    const SWEEP_DEG: f32 = 270.0; // ends at 4:30 o'clock (lower-right)
-
-    // Pre-computed cap centres for the fixed track endpoints.
-    // 135°: x = 180 + 170*cos(135°) = 180 - 120.2 ≈ 60, y = 180 + 170*sin(135°) ≈ 300
+    // Cap circles at the fixed arc endpoints (135° and 45°).
     const CAP_START: Point = Point::new(60, 300);
-    // 405°=45°: x = 180 + 170*cos(45°) ≈ 300, y ≈ 300
     const CAP_END: Point = Point::new(300, 300);
 
-    // Wipe the bar's annular footprint to black before drawing. The Arc and
-    // Circle primitives in embedded-graphics each make slightly different
-    // edge-pixel decisions (different center_2x, different inclusion paths
-    // through PlaneSector for Intersection vs Union sweeps), so a stale
-    // white pixel from a previous frame can survive both the gray arc's
-    // overdraw and the new white arc's overdraw — appearing as a bright
-    // sliver along the inner edge. Wiping with a wider stroke than the
-    // visible bar guarantees nothing from the prior frame survives.
-    //
-    // Wipe stroke 32 covers radii 154–186 (centerline 170 ± 16), which
-    // brackets the bar's 163–177 range plus the cap circles that extend
-    // ~7 px past the centerline at the tip.
-    Arc::new(TOP_LEFT, DIAMETER, Angle::from_degrees(START_DEG), Angle::from_degrees(SWEEP_DEG))
-        .into_styled(PrimitiveStyle::with_stroke(Rgb565::BLACK, 32))
-        .draw(display)
-        .unwrap();
-    // Wipe also covers the cap circles' bounding regions at the fixed
-    // endpoints — they sit at the start/end of the 270° sweep, but the
-    // Arc primitive's inclusion test may not reach the very corners of
-    // those cap pixels at the angular boundaries.
+    // Wipe the full 360° ring (wider than the visible track) to black.
+    // Using full 360° (not 270°) means the cap-circle pixels that straddle
+    // the angular boundaries are cleared without needing a separate angular
+    // check — the gap at the bottom stays black anyway since neither the gray
+    // nor the fill arc will repaint it.
+    display.fill_ring(CX, CY, 154, 186, Rgb565::BLACK);
     draw_arc_cap(display, CAP_START, 32, Rgb565::BLACK);
     draw_arc_cap(display, CAP_END, 32, Rgb565::BLACK);
 
-    // Full track in dim gray, then round caps at both track endpoints.
-    Arc::new(TOP_LEFT, DIAMETER, Angle::from_degrees(START_DEG), Angle::from_degrees(SWEEP_DEG))
-        .into_styled(PrimitiveStyle::with_stroke(Rgb565::CSS_DIM_GRAY, STROKE))
-        .draw(display)
-        .unwrap();
+    // Full 270° track in dim gray.
+    display.fill_ring_270(CX, CY, 163, 177, Rgb565::CSS_DIM_GRAY);
     draw_arc_cap(display, CAP_START, STROKE, Rgb565::CSS_DIM_GRAY);
     draw_arc_cap(display, CAP_END, STROKE, Rgb565::CSS_DIM_GRAY);
 
-    // Filled portion proportional to volume.
-    let fill_sweep = SWEEP_DEG * (volume as f32 / 100.0);
+    // White fill proportional to volume.
+    let fill_sweep = 270.0_f32 * (volume as f32 / 100.0);
     if fill_sweep >= 1.0 {
-        Arc::new(
-            TOP_LEFT,
-            DIAMETER,
-            Angle::from_degrees(START_DEG),
-            Angle::from_degrees(fill_sweep),
-        )
-        .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, STROKE))
-        .draw(display)
-        .unwrap();
-
-        // White cap at fill start (overlays the gray one).
+        display.fill_ring_arc(CX, CY, 163, 177, fill_sweep, Rgb565::WHITE);
         draw_arc_cap(display, CAP_START, STROKE, Rgb565::WHITE);
-
-        // White cap at fill tip — position computed at runtime from the sweep angle.
         draw_arc_cap(display, arc_tip_point(fill_sweep), STROKE, Rgb565::WHITE);
     }
 }
