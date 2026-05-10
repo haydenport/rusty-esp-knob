@@ -10,3 +10,4 @@ rustflags = ["-C", "link-arg=-Tlinkall.x"]
 
 [env]
 ESP_LOG = "info"
+ESP_HAL_CONFIG_PSRAM_MODE = "octal"

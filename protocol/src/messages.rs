@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 /// Protocol version. Bump on breaking changes.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Messages sent from the PC companion to the firmware.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,6 +30,14 @@ pub enum HostToDevice {
     },
     /// Echo test — device replies with `Echo` containing the same payload.
     Echo(Vec<u8>),
+    /// Provision WiFi credentials. Device stores in flash and initiates connection.
+    /// SSID max 32 bytes (IEEE 802.11), password max 64 bytes (WPA2).
+    SetWifiConfig {
+        ssid: heapless::String<32>,
+        password: heapless::String<64>,
+    },
+    /// Request the device's current WiFi connection status.
+    GetWifiStatus,
 }
 
 /// Messages sent from the firmware to the PC companion.
@@ -55,6 +63,12 @@ pub enum DeviceToHost {
     /// Ack that the firmware has fully processed a command from the host.
     /// Used by the companion as flow control for large writes (icon pushes).
     Ack,
+    /// WiFi connection status. Sent unsolicited after a connection attempt
+    /// and in reply to `GetWifiStatus`. `ip` is empty when not connected.
+    WifiStatus {
+        connected: bool,
+        ip: heapless::String<16>,
+    },
 }
 
 /// Minimal info about an audio app. Icons are sent separately via `SetAppIcon`.

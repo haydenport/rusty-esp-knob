@@ -123,7 +123,8 @@ fn cmd_run(port_override: Option<String>) {
     let (status_tx, _status_rx) = std::sync::mpsc::channel();
 
     // Run the event loop on the current thread (blocking until port error or Ctrl+C).
-    worker::run(&port_name, sensitivity, backlight, stop, status_tx);
+    let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    worker::run(&port_name, sensitivity, backlight, stop, status_tx, cmd_rx);
 }
 
 // ── List ─────────────────────────────────────────────────────────────────────
@@ -197,20 +198,20 @@ fn cmd_serial_test(port_name: &str) {
     std::thread::sleep(Duration::from_millis(200));
 
     let mut decoder = Decoder::new(16 * 1024);
-    let _ = worker::drain_for(&mut *port, Duration::from_millis(100), &mut decoder);
+    let _ = worker::drain_for(&mut port,Duration::from_millis(100), &mut decoder);
     decoder = Decoder::new(16 * 1024);
 
     println!("\n>>> sending Ping");
-    worker::send(&mut *port, &HostToDevice::Ping);
-    worker::drain_for(&mut *port, Duration::from_millis(500), &mut decoder);
+    worker::send(&mut port,&HostToDevice::Ping);
+    worker::drain_for(&mut port,Duration::from_millis(500), &mut decoder);
 
     let payload = b"hello, knob!".to_vec();
     println!("\n>>> sending Echo({:?})", String::from_utf8_lossy(&payload));
-    worker::send(&mut *port, &HostToDevice::Echo(payload));
-    worker::drain_for(&mut *port, Duration::from_millis(500), &mut decoder);
+    worker::send(&mut port,&HostToDevice::Echo(payload));
+    worker::drain_for(&mut port,Duration::from_millis(500), &mut decoder);
 
     println!("\n>>> listening for 10s — turn the knob or tap the screen");
-    worker::drain_for(&mut *port, Duration::from_secs(10), &mut decoder);
+    worker::drain_for(&mut port,Duration::from_secs(10), &mut decoder);
 
     println!("\ndone.");
 }
@@ -273,25 +274,25 @@ fn cmd_push_apps(port_name: &str) {
     std::thread::sleep(Duration::from_millis(200));
 
     let mut decoder = Decoder::new(16 * 1024);
-    let _ = worker::drain_for(&mut *port, Duration::from_millis(100), &mut decoder);
+    let _ = worker::drain_for(&mut port,Duration::from_millis(100), &mut decoder);
     let _ = port.clear(ClearBuffer::Input);
     decoder = Decoder::new(16 * 1024);
 
     let first_id = app_infos[0].id;
     println!("\n>>> sending SetAppList ({} apps)", app_infos.len());
-    worker::send_and_wait(&mut *port, &mut decoder, &HostToDevice::SetAppList(app_infos));
+    worker::send_and_wait(&mut port,&mut decoder, &HostToDevice::SetAppList(app_infos));
     println!(">>> sending SetSelectedApp({first_id})");
-    worker::send_and_wait(&mut *port, &mut decoder, &HostToDevice::SetSelectedApp(first_id));
+    worker::send_and_wait(&mut port,&mut decoder, &HostToDevice::SetSelectedApp(first_id));
     for (app_id, pixels) in icons_out {
         println!(">>> sending SetAppIcon(app_id={app_id}, {}B)", pixels.len());
         worker::send_and_wait(
-            &mut *port,
+            &mut port,
             &mut decoder,
             &HostToDevice::SetAppIcon { app_id, pixels },
         );
     }
 
     println!("\n>>> listening for 3s");
-    worker::drain_for(&mut *port, Duration::from_secs(3), &mut decoder);
+    worker::drain_for(&mut port,Duration::from_secs(3), &mut decoder);
     println!("\ndone.");
 }

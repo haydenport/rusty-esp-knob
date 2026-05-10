@@ -7,13 +7,16 @@ mod backlight;
 mod board;
 mod encoder;
 mod haptic;
+mod nvs_config;
 mod sh8601;
 mod touch;
 mod usb_serial;
+mod wifi_tcp;
 
 use esp_alloc as _;
 use esp_backtrace as _;
 esp_bootloader_esp_idf::esp_app_desc!();
+use esp_hal::analog::adc::{Adc, AdcConfig, Attenuation};
 use esp_hal::delay::Delay;
 use esp_hal::dma::{DmaRxBuf, DmaTxBuf};
 use esp_hal::dma_buffers;
@@ -210,12 +213,84 @@ fn draw_not_connected(display: &mut Sh8601) {
     let font = FontRenderer::new::<u8g2_font_helvR24_tr>();
     font.render_aligned(
         "NOT DETECTED",
-        Point::new(180, 200),
+        Point::new(180, 190),
         VerticalPosition::Baseline,
         HorizontalAlignment::Center,
         FontColor::Transparent(Rgb565::YELLOW),
         display,
     ).unwrap();
+}
+
+/// Draw a small WiFi status line below the "NOT DETECTED" message.
+/// Pass an empty string to clear the line.
+fn draw_wifi_line(display: &mut Sh8601, text: &str) {
+    use embedded_graphics::primitives::PrimitiveStyle;
+    Rectangle::new(Point::new(40, 205), Size::new(280, 28))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+        .draw(display)
+        .unwrap();
+    if !text.is_empty() {
+        let font = FontRenderer::new::<u8g2_fonts::fonts::u8g2_font_helvR12_tr>();
+        font.render_aligned(
+            text,
+            Point::new(180, 228),
+            VerticalPosition::Baseline,
+            HorizontalAlignment::Center,
+            FontColor::Transparent(Rgb565::CSS_CORNFLOWER_BLUE),
+            display,
+        ).unwrap();
+    }
+}
+
+/// Draw a small battery icon + percentage in the bottom arc gap (centered x=180, y≈314–336).
+/// Colors: green >50 %, yellow >20 %, red ≤20 %.
+fn draw_battery(display: &mut Sh8601, pct: u8) {
+    use core::fmt::Write as FmtWrite;
+
+    const BX: i32 = 154;  // body left
+    const BY: i32 = 306;  // body top
+    const BW: u32 = 52;   // body width
+    const BH: u32 = 22;   // body height
+
+    // Clear the region (body + nub)
+    Rectangle::new(Point::new(BX - 1, BY - 1), Size::new(BW + 7, BH + 2))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+        .draw(display).unwrap();
+
+    let color = if pct > 50 { Rgb565::CSS_LIME_GREEN }
+                else if pct > 20 { Rgb565::YELLOW }
+                else { Rgb565::RED };
+
+    // Outer body border
+    Rectangle::new(Point::new(BX, BY), Size::new(BW, BH))
+        .into_styled(PrimitiveStyle::with_stroke(color, 2))
+        .draw(display).unwrap();
+
+    // Nub on right side
+    Rectangle::new(Point::new(BX + BW as i32, BY + 6), Size::new(5, 10))
+        .into_styled(PrimitiveStyle::with_fill(color))
+        .draw(display).unwrap();
+
+    // Proportional fill inside body
+    let fill_w = (pct as u32 * (BW - 4) / 100).min(BW - 4);
+    if fill_w > 0 {
+        Rectangle::new(Point::new(BX + 2, BY + 2), Size::new(fill_w, BH - 4))
+            .into_styled(PrimitiveStyle::with_fill(color))
+            .draw(display).unwrap();
+    }
+
+    // Percentage text centered in body
+    let mut buf: heapless::String<8> = heapless::String::new();
+    let _ = write!(buf, "{}%", pct);
+    let font = FontRenderer::new::<u8g2_fonts::fonts::u8g2_font_helvR12_tr>();
+    let _ = font.render_aligned(
+        buf.as_str(),
+        Point::new(BX + BW as i32 / 2, BY + BH as i32 - 3),
+        VerticalPosition::Baseline,
+        HorizontalAlignment::Center,
+        FontColor::Transparent(Rgb565::WHITE),
+        display,
+    );
 }
 
 /// Blit a raw RGB565 image (big-endian, width×height pixels) to the display.
@@ -326,6 +401,16 @@ fn draw_status(display: &mut Sh8601, text: &str) {
     ).unwrap();
 }
 
+/// Convert a 12-bit ADC reading (GPIO1, 11 dB attenuation) to a battery
+/// percentage.  The on-board 10k/10k divider halves VBAT before the pin;
+/// 11 dB attenuation gives ~3100 mV full scale.  LiPo range: 3000 mV (0 %)
+/// to 4200 mV (100 %).
+fn raw_to_batt_pct(raw: u16) -> u8 {
+    let vpin_mv = (raw as u32 * 3100) / 4095;
+    let vbat_mv = vpin_mv * 2;
+    ((vbat_mv.saturating_sub(3000)) * 100 / 1200).min(100) as u8
+}
+
 #[main]
 fn main() -> ! {
     // NOTE: esp-println logger is intentionally NOT initialized — it would
@@ -334,10 +419,13 @@ fn main() -> ! {
     // esp-backtrace (and those frames are corrupt on purpose — you want the trace).
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
-    // Initialize heap allocator for framebuffer + protocol buffers (internal SRAM).
-    // Framebuffer is ~253 KB; the rest covers decoder, icon, and app-list allocations.
-    // ~295 KB is the ceiling before the heap collides with the stack region.
-    esp_alloc::heap_allocator!(size: 290_000);
+    // Internal SRAM heap: WiFi stack, decoders, app list (~92 KB WiFi + ~30 KB other).
+    // Reduced from 290 KB to leave room for WiFi sys BSS (~84 KB static at link time).
+    esp_alloc::heap_allocator!(size: 160_000);
+
+    // PSRAM heap: framebuffer (259 KB) and any remaining large allocations.
+    // Must come after heap_allocator! so small allocs prefer internal SRAM.
+    esp_alloc::psram_allocator!(&peripherals.PSRAM, esp_hal::psram);
 
 
     info!("Volume Knob Controller - firmware starting");
@@ -376,9 +464,21 @@ fn main() -> ! {
     display.init().expect("Display init failed");
     info!("Display initialized");
 
+    // Battery ADC: GPIO1 via 10k/10k divider from VBAT, 11 dB attenuation covers
+    // the full 1.5–2.1 V range produced by the divider across a 3.0–4.2 V LiPo.
+    let mut adc1_config = AdcConfig::new();
+    let mut batt_pin = adc1_config.enable_pin(peripherals.GPIO1, Attenuation::_11dB);
+    let mut adc1 = Adc::new(peripherals.ADC1, adc1_config);
+
+    // Initial battery reading before first display flush.
+    let init_batt_raw = nb::block!(adc1.read_oneshot(&mut batt_pin)).unwrap_or(2000);
+    let mut batt_pct: u8 = raw_to_batt_pct(init_batt_raw);
+    let mut last_batt_tick: u32 = 0;
+
     // Draw initial screen — companion not yet connected.
     draw_not_connected(&mut display);
     draw_volume(&mut display, 50);
+    draw_battery(&mut display, batt_pct);
     display.flush().expect("Flush failed");
     info!("Screen drawn");
 
@@ -408,6 +508,26 @@ fn main() -> ! {
     let mut usb = UsbSerial::new(UsbSerialJtag::new(peripherals.USB_DEVICE));
     let mut ready_sent = false;
     info!("USB serial ready");
+
+    let mut nvs = nvs_config::NvsConfig::new(peripherals.FLASH);
+    let mut wifi_timg1 = Some(peripherals.TIMG1);
+    let mut wifi_periph = Some(peripherals.WIFI);
+    let mut wifi: Option<wifi_tcp::WifiTcp> = if let Some(creds) = nvs.load() {
+        if let (Some(t), Some(p)) = (wifi_timg1.take(), wifi_periph.take()) {
+            let w = wifi_tcp::init_wifi(t, p, &creds.ssid, &creds.password);
+            if w.is_some() {
+                draw_wifi_line(&mut display, "WiFi: connecting...");
+                display.flush().expect("Flush failed");
+            }
+            w
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut wifi_ready_sent = false;
+    let mut wifi_was_active = false;
 
     let delay = Delay::new();
     let mut last_count: i32 = 0;
@@ -449,6 +569,7 @@ fn main() -> ! {
 
             if let Some(app_id) = selected_app {
                 let _ = usb.send(&DeviceToHost::VolumeDelta { app_id, delta });
+                if let Some(w) = wifi.as_mut() { if w.is_active() { w.send(&DeviceToHost::VolumeDelta { app_id, delta }); } }
             } else {
                 let prev_vol = standalone_value;
                 standalone_value = (standalone_value as i16 + delta as i16)
@@ -487,6 +608,7 @@ fn main() -> ! {
                     redraw_app(&mut display, &apps, selected_app, &current_icon, current_volume);
                     draw_mute_indicator(&mut display, current_muted);
                 }
+                draw_battery(&mut display, batt_pct);
                 needs_flush = true;
             }
         } else {
@@ -511,12 +633,11 @@ fn main() -> ! {
                     if let Some(id) = selected_app {
                         haptic.play(&mut i2c, Effect::SharpClick);
                         let _ = usb.send(&DeviceToHost::MuteToggle { app_id: id });
+                        if let Some(w) = wifi.as_mut() { if w.is_active() { w.send(&DeviceToHost::MuteToggle { app_id: id }); } }
                     }
                 }
                 touch::Gesture::LongPress => {
                     haptic.play(&mut i2c, Effect::StrongClick);
-                    draw_status(&mut display, "LONG PRESS");
-                    needs_flush = true;
                 }
                 touch::Gesture::SwipeLeft => {
                     if !apps.is_empty() {
@@ -534,6 +655,7 @@ fn main() -> ! {
                         redraw_app(&mut display, &apps, selected_app, &[], current_volume);
                         draw_mute_indicator(&mut display, current_muted);
                         let _ = usb.send(&DeviceToHost::AppSelected(app.id));
+                        if let Some(w) = wifi.as_mut() { if w.is_active() { w.send(&DeviceToHost::AppSelected(app.id)); } }
                         needs_flush = true;
                     }
                 }
@@ -553,6 +675,7 @@ fn main() -> ! {
                         redraw_app(&mut display, &apps, selected_app, &[], current_volume);
                         draw_mute_indicator(&mut display, current_muted);
                         let _ = usb.send(&DeviceToHost::AppSelected(app.id));
+                        if let Some(w) = wifi.as_mut() { if w.is_active() { w.send(&DeviceToHost::AppSelected(app.id)); } }
                         needs_flush = true;
                     }
                 }
@@ -560,6 +683,156 @@ fn main() -> ! {
             }
             if let Some(kind) = to_wire_gesture(event.gesture) {
                 let _ = usb.send(&DeviceToHost::Gesture(kind));
+                if let Some(w) = wifi.as_mut() { if w.is_active() { w.send(&DeviceToHost::Gesture(kind)); } }
+            }
+        }
+
+        // Poll WiFi transport: advance smoltcp, drain events, decode one message.
+        let timestamp_ms = loop_tick as u64 * 3;
+        {
+            let now_active = wifi.as_ref().map(|w| w.is_active()).unwrap_or(false);
+            if !now_active && wifi_was_active {
+                wifi_ready_sent = false;
+            }
+            wifi_was_active = now_active;
+
+            if let Some(event) = wifi.as_mut().and_then(|w| w.take_event()) {
+                let _ = usb.send(&event);
+                // Show WiFi status on the not-connected screen.
+                if apps.is_empty() {
+                    if let DeviceToHost::WifiStatus { connected, ref ip } = event {
+                        if connected {
+                            let mut line: heapless::String<24> = heapless::String::new();
+                            let _ = core::fmt::write(&mut line, format_args!("WiFi: {}", ip));
+                            draw_wifi_line(&mut display, line.as_str());
+                        } else {
+                            draw_wifi_line(&mut display, "WiFi: disconnected");
+                        }
+                        needs_flush = true;
+                    }
+                }
+            }
+
+            let wifi_msg = wifi.as_mut().and_then(|w| w.poll(timestamp_ms));
+            if let Some(msg) = wifi_msg {
+                last_host_msg_tick = loop_tick;
+                if !wifi_ready_sent {
+                    if let Some(w) = wifi.as_mut() {
+                        let _ = w.send(&DeviceToHost::Ready { version: PROTOCOL_VERSION });
+                    }
+                    wifi_ready_sent = true;
+                }
+                let mut wifi_ack = true;
+                let mut wifi_config_pending: Option<nvs_config::WifiCredentials> = None;
+                match msg {
+                    HostToDevice::Ping => {
+                        wifi_ack = false;
+                        if let Some(w) = wifi.as_mut() { let _ = w.send(&DeviceToHost::Pong); }
+                    }
+                    HostToDevice::Echo(data) => {
+                        wifi_ack = false;
+                        if let Some(w) = wifi.as_mut() { let _ = w.send(&DeviceToHost::Echo(data)); }
+                    }
+                    HostToDevice::SetBacklight { active_pct, dim_after_secs, off_after_secs } => {
+                        backlight.set_active_pct(active_pct);
+                        backlight.set_timeouts(dim_after_secs, off_after_secs);
+                    }
+                    HostToDevice::SetAppList(list) => {
+                        backlight.notify_activity(loop_tick);
+                        apps = list;
+                        if selected_app.is_none() {
+                            selected_app = apps.first().map(|a| a.id);
+                            selected_idx = 0;
+                        } else {
+                            selected_idx = apps.iter().position(|a| Some(a.id) == selected_app).unwrap_or(0);
+                        }
+                        if let Some(id) = selected_app {
+                            if let Some(app) = apps.iter().find(|a| a.id == id) {
+                                current_volume = app.volume;
+                                current_muted = app.muted;
+                            }
+                        }
+                        redraw_app(&mut display, &apps, selected_app, &current_icon, current_volume);
+                        draw_mute_indicator(&mut display, current_muted);
+                        needs_flush = true;
+                    }
+                    HostToDevice::SetAppIcon { app_id, pixels } => {
+                        if selected_app == Some(app_id) {
+                            current_icon = pixels;
+                            draw_app_icon(&mut display, &current_icon);
+                            needs_flush = true;
+                        }
+                    }
+                    HostToDevice::SetSelectedApp(id) => {
+                        backlight.notify_activity(loop_tick);
+                        selected_app = Some(id);
+                        selected_idx = apps.iter().position(|a| a.id == id).unwrap_or(0);
+                        current_icon = Vec::new();
+                        if let Some(app) = apps.iter().find(|a| a.id == id) {
+                            current_volume = app.volume;
+                            current_muted = app.muted;
+                        }
+                        redraw_app(&mut display, &apps, selected_app, &current_icon, current_volume);
+                        draw_mute_indicator(&mut display, current_muted);
+                        needs_flush = true;
+                    }
+                    HostToDevice::SetVolume { app_id, level } => {
+                        backlight.notify_activity(loop_tick);
+                        if let Some(app) = apps.iter_mut().find(|a| a.id == app_id) {
+                            app.volume = level;
+                        }
+                        if selected_app == Some(app_id) {
+                            let prev_vol = current_volume;
+                            current_volume = level;
+                            let (dy0, dy1) = draw_volume_delta(&mut display, prev_vol, current_volume);
+                            display.flush_rows(dy0, dy1).expect("Flush failed");
+                            needs_flush = false;
+                        }
+                    }
+                    HostToDevice::SetMute { app_id, muted } => {
+                        backlight.notify_activity(loop_tick);
+                        if let Some(app) = apps.iter_mut().find(|a| a.id == app_id) {
+                            app.muted = muted;
+                        }
+                        if selected_app == Some(app_id) {
+                            current_muted = muted;
+                            haptic.play(&mut i2c, Effect::SharpClick);
+                            draw_mute_indicator(&mut display, current_muted);
+                            needs_flush = true;
+                        }
+                    }
+                    HostToDevice::SetWifiConfig { ssid, password } => {
+                        wifi_config_pending = Some(nvs_config::WifiCredentials { ssid, password });
+                    }
+                    HostToDevice::GetWifiStatus => {
+                        wifi_ack = false;
+                        if let Some(w) = wifi.as_mut() {
+                            let ip = w.connected_ip.clone().unwrap_or_default();
+                            let connected = w.connected_ip.is_some();
+                            let _ = w.send(&DeviceToHost::WifiStatus { connected, ip });
+                        }
+                    }
+                }
+                if needs_flush {
+                    display.flush().expect("Flush failed");
+                    needs_flush = false;
+                }
+                if wifi_ack {
+                    if let Some(w) = wifi.as_mut() { let _ = w.send(&DeviceToHost::Ack); }
+                }
+                if let Some(creds) = wifi_config_pending {
+                    if nvs.save(&creds).is_ok() {
+                        if let (Some(t), Some(p)) = (wifi_timg1.take(), wifi_periph.take()) {
+                            wifi = wifi_tcp::init_wifi(t, p, &creds.ssid, &creds.password);
+                        } else {
+                            let mut reboot_ip: heapless::String<16> = heapless::String::new();
+                            let _ = reboot_ip.push_str("REBOOT");
+                            if let Some(w) = wifi.as_mut() {
+                                let _ = w.send(&DeviceToHost::WifiStatus { connected: false, ip: reboot_ip });
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -653,6 +926,26 @@ fn main() -> ! {
                         needs_flush = true;
                     }
                 }
+                HostToDevice::SetWifiConfig { ssid, password } => {
+                    let creds = nvs_config::WifiCredentials { ssid, password };
+                    if nvs.save(&creds).is_ok() {
+                        if let (Some(t), Some(p)) = (wifi_timg1.take(), wifi_periph.take()) {
+                            wifi = wifi_tcp::init_wifi(t, p, &creds.ssid, &creds.password);
+                        } else {
+                            // WiFi already initialized; new creds saved, reboot to apply.
+                            let mut reboot_ip: heapless::String<16> = heapless::String::new();
+                            let _ = reboot_ip.push_str("REBOOT");
+                            ack = false;
+                            let _ = usb.send(&DeviceToHost::WifiStatus { connected: false, ip: reboot_ip });
+                        }
+                    }
+                }
+                HostToDevice::GetWifiStatus => {
+                    ack = false;
+                    let ip = wifi.as_ref().and_then(|w| w.connected_ip.clone()).unwrap_or_default();
+                    let connected = wifi.as_ref().map(|w| w.connected_ip.is_some()).unwrap_or(false);
+                    let _ = usb.send(&DeviceToHost::WifiStatus { connected, ip });
+                }
             }
             // Flush now so the host sees `Ack` only after the display work
             // for this message is actually done.
@@ -665,14 +958,15 @@ fn main() -> ! {
             }
         }
 
-        // Detect companion disconnect: ~9 s of silence (3 000 ticks × 3 ms)
+        // Detect companion disconnect: ~30 s of silence (10 000 ticks × 3 ms)
         // while an app list is loaded means the companion has gone away.
-        if !apps.is_empty() && loop_tick.wrapping_sub(last_host_msg_tick) > 3_000 {
+        if !apps.is_empty() && loop_tick.wrapping_sub(last_host_msg_tick) > 10_000 {
             apps.clear();
             selected_app = None;
             current_icon.clear();
             draw_not_connected(&mut display);
             draw_volume(&mut display, standalone_value);
+            draw_battery(&mut display, batt_pct);
             needs_flush = true;
         }
 
@@ -688,6 +982,18 @@ fn main() -> ! {
             }
             display.flush().expect("Flush failed");
             needs_flush = false;
+        }
+
+        // Refresh battery every ~30 s (10 000 ticks × 3 ms).
+        if loop_tick.wrapping_sub(last_batt_tick) >= 10_000 {
+            last_batt_tick = loop_tick;
+            let raw = nb::block!(adc1.read_oneshot(&mut batt_pin)).unwrap_or(2000);
+            let new_pct = raw_to_batt_pct(raw);
+            if new_pct != batt_pct {
+                batt_pct = new_pct;
+                draw_battery(&mut display, batt_pct);
+                display.flush_rows(305, 330).expect("Flush failed");
+            }
         }
 
         backlight.tick(loop_tick);

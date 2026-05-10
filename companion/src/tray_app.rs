@@ -2,11 +2,13 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
+use dirs;
+
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::config::{self, Config};
-use crate::worker::{self, BacklightShared, WorkerStatus};
+use crate::worker::{self, BacklightShared, WorkerCommand, WorkerStatus};
 
 /// Entry point for tray mode. Blocks until the user chooses Exit.
 pub fn run(port_name: String, cfg: Config) {
@@ -31,12 +33,32 @@ pub fn run(port_name: String, cfg: Config) {
         cfg.backlight_off_after_secs,
     ));
     let (status_tx, status_rx) = mpsc::channel::<WorkerStatus>();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>();
 
     let stop_worker = stop.clone();
     let sens_worker = sensitivity.clone();
     let backlight_worker = backlight.clone();
+    let conn_mode = cfg.connection_mode.clone();
+    let wifi_ip = cfg.wifi_device_ip.clone();
+    let wifi_port_num = cfg.wifi_port;
+    let port_name_worker = port_name.clone();
     std::thread::spawn(move || {
-        worker::run(&port_name, sens_worker, backlight_worker, stop_worker, status_tx);
+        match conn_mode.as_str() {
+            "wifi" if !wifi_ip.is_empty() => {
+                worker::run_wifi(
+                    &wifi_ip,
+                    wifi_port_num,
+                    sens_worker,
+                    backlight_worker,
+                    stop_worker,
+                    status_tx,
+                    cmd_rx,
+                );
+            }
+            _ => {
+                worker::run(&port_name_worker, sens_worker, backlight_worker, stop_worker, status_tx, cmd_rx);
+            }
+        }
     });
 
     // Mutable local config copy for updating from menu events.
@@ -92,6 +114,20 @@ pub fn run(port_name: String, cfg: Config) {
                     set_dim_after(&mut live_cfg, &backlight, &ids, secs);
                 } else if let Some(secs) = ids.off_choice(id) {
                     set_off_after(&mut live_cfg, &backlight, &ids, secs);
+                } else if id == &ids.conn_usb {
+                    set_connection_mode(&mut live_cfg, &ids, "usb");
+                    let _ = _tray.set_tooltip(Some("Rusty ESP Knob — restart to apply mode change"));
+                } else if id == &ids.conn_wifi {
+                    set_connection_mode(&mut live_cfg, &ids, "wifi");
+                    let _ = _tray.set_tooltip(Some("Rusty ESP Knob — restart to apply mode change"));
+                } else if id == &ids.conn_auto {
+                    set_connection_mode(&mut live_cfg, &ids, "auto");
+                    let _ = _tray.set_tooltip(Some("Rusty ESP Knob — restart to apply mode change"));
+                } else if id == &ids.wifi_configure {
+                    open_config_file();
+                } else if id == &ids.wifi_provision {
+                    let tx = cmd_tx.clone();
+                    std::thread::spawn(move || provision_wifi_dialog(tx));
                 }
             }
 
@@ -159,6 +195,119 @@ fn set_off_after(
     config::save(cfg);
 }
 
+fn set_connection_mode(cfg: &mut Config, ids: &MenuIds, mode: &str) {
+    cfg.connection_mode = mode.to_string();
+    ids.conn_usb_item.set_checked(mode == "usb");
+    ids.conn_wifi_item.set_checked(mode == "wifi");
+    ids.conn_auto_item.set_checked(mode == "auto");
+    // Load from disk first so fields updated by other paths (e.g.
+    // wifi_device_ip written by provisioning) are not overwritten.
+    let mut ondisk = config::load();
+    ondisk.connection_mode = mode.to_string();
+    config::save(&ondisk);
+    // Keep live_cfg's wifi_device_ip in sync with what's on disk.
+    cfg.wifi_device_ip = ondisk.wifi_device_ip;
+}
+
+fn open_config_file() {
+    let mut path = dirs::config_dir().unwrap_or_default();
+    path.push("RustyEspKnob");
+    path.push("config.toml");
+    // Ensure the file exists so the editor opens it, even if empty.
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, "");
+    }
+    let _ = std::process::Command::new("notepad.exe").arg(&path).spawn();
+}
+
+/// Show PowerShell InputBox dialogs to gather WiFi credentials, then send
+/// them to the device through the running worker's existing connection.
+/// Runs on a background thread — does NOT touch the tray event loop.
+fn provision_wifi_dialog(cmd_tx: std::sync::mpsc::Sender<WorkerCommand>) {
+    let script = r#"
+Add-Type -AssemblyName Microsoft.VisualBasic
+$ssid = [Microsoft.VisualBasic.Interaction]::InputBox('Enter WiFi network name (SSID):', 'WiFi Setup - Step 1 of 2', '')
+if ([string]::IsNullOrEmpty($ssid)) { exit 2 }
+$pass = [Microsoft.VisualBasic.Interaction]::InputBox('Enter WiFi password:', 'WiFi Setup - Step 2 of 2', '')
+if ([string]::IsNullOrEmpty($pass)) { exit 2 }
+Write-Output $ssid
+Write-Output $pass
+"#;
+
+    let output = std::process::Command::new("powershell")
+        .args(["-WindowStyle", "Hidden", "-NonInteractive", "-Command", script])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let mut lines = stdout.lines();
+            let ssid_str = lines.next().unwrap_or("").trim().to_string();
+            let pass_str = lines.next().unwrap_or("").trim().to_string();
+            if ssid_str.is_empty() {
+                return;
+            }
+            let ssid: heapless::String<32> = match ssid_str.as_str().try_into() {
+                Ok(s) => s,
+                Err(_) => {
+                    show_message("WiFi Setup Failed", "SSID too long (max 32 characters).");
+                    return;
+                }
+            };
+            let password: heapless::String<64> = match pass_str.as_str().try_into() {
+                Ok(p) => p,
+                Err(_) => {
+                    show_message("WiFi Setup Failed", "Password too long (max 64 characters).");
+                    return;
+                }
+            };
+            let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+            if cmd_tx.send(WorkerCommand::ProvisionWifi { ssid, password, reply: reply_tx }).is_err() {
+                show_message("WiFi Setup Failed", "The worker is not running. Make sure the device is connected.");
+                return;
+            }
+            show_message("WiFi Setup", "Credentials sent to device.\nWaiting for WiFi connection (up to 30 seconds)…");
+            match reply_rx.recv_timeout(std::time::Duration::from_secs(35)) {
+                Ok(Ok(ip)) => {
+                    let msg = format!(
+                        "WiFi provisioned successfully!\n\nDevice IP: {ip}\n\nThe IP has been saved. Select \"WiFi (TCP)\" in the\nWiFi / Connection submenu, then restart the companion\nto connect wirelessly."
+                    );
+                    show_message("WiFi Setup Complete", &msg);
+                }
+                Ok(Err(e)) => {
+                    show_message("WiFi Setup Failed", &format!("{e}"));
+                }
+                Err(_) => {
+                    show_message("WiFi Setup Failed", "Timed out waiting for the device to connect.");
+                }
+            }
+        }
+        Ok(out) if out.status.code() == Some(2) => {
+            // User cancelled — do nothing.
+        }
+        Ok(_) | Err(_) => {
+            show_message("WiFi Setup Error", "Failed to launch the input dialog.\nMake sure PowerShell is available.");
+        }
+    }
+}
+
+fn show_message(title: &str, text: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+    let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        MessageBoxW(
+            None,
+            windows::core::PCWSTR(wide_text.as_ptr()),
+            windows::core::PCWSTR(wide_title.as_ptr()),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
 // ── Menu ─────────────────────────────────────────────────────────────────────
 
 struct MenuIds {
@@ -177,6 +326,14 @@ struct MenuIds {
     dim_items: Vec<(CheckMenuItem, u16)>,
     /// `(item, off_after_secs)` pairs. `0` = "Never".
     off_items: Vec<(CheckMenuItem, u16)>,
+    conn_usb: tray_icon::menu::MenuId,
+    conn_wifi: tray_icon::menu::MenuId,
+    conn_auto: tray_icon::menu::MenuId,
+    conn_usb_item: CheckMenuItem,
+    conn_wifi_item: CheckMenuItem,
+    conn_auto_item: CheckMenuItem,
+    wifi_configure: tray_icon::menu::MenuId,
+    wifi_provision: tray_icon::menu::MenuId,
 }
 
 impl MenuIds {
@@ -273,6 +430,28 @@ fn build_menu(cfg: &Config) -> (Menu, MenuIds) {
     let autostart = CheckMenuItem::new("Auto-start on login", true, cfg.autostart, None);
     let _ = menu.append(&autostart);
 
+    // WiFi submenu.
+    let cm = cfg.connection_mode.as_str();
+    let conn_usb = CheckMenuItem::new("USB (serial)", true, cm == "usb", None);
+    let conn_wifi = CheckMenuItem::new("WiFi (TCP)", true, cm == "wifi", None);
+    let conn_auto = CheckMenuItem::new("Auto", true, cm == "auto", None);
+    let wifi_configure = MenuItem::new("Edit Config File...", true, None);
+    let wifi_provision = MenuItem::new("Provision WiFi via USB...", true, None);
+    let wifi_sub = Submenu::with_items(
+        "WiFi / Connection",
+        true,
+        &[
+            &conn_usb as &dyn tray_icon::menu::IsMenuItem,
+            &conn_wifi,
+            &conn_auto,
+            &PredefinedMenuItem::separator(),
+            &wifi_provision,
+            &wifi_configure,
+        ],
+    )
+    .expect("wifi submenu");
+    let _ = menu.append(&wifi_sub);
+
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     let exit = MenuItem::new("Exit", true, None);
@@ -291,6 +470,14 @@ fn build_menu(cfg: &Config) -> (Menu, MenuIds) {
         brightness_items,
         dim_items,
         off_items,
+        conn_usb: conn_usb.id().clone(),
+        conn_wifi: conn_wifi.id().clone(),
+        conn_auto: conn_auto.id().clone(),
+        conn_usb_item: conn_usb,
+        conn_wifi_item: conn_wifi,
+        conn_auto_item: conn_auto,
+        wifi_configure: wifi_configure.id().clone(),
+        wifi_provision: wifi_provision.id().clone(),
     };
 
     (menu, ids)

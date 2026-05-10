@@ -48,6 +48,9 @@ pub const SD_D3: u8 = 2;
 pub const SD_CMD: u8 = 3;
 pub const SD_CLK: u8 = 4;
 
+// --- Battery ADC (voltage divider 10k/10k from VBAT → GPIO1) ---
+pub const BATT_ADC: u8 = 1;
+
 // --- Display dimensions ---
 pub const DISPLAY_WIDTH: u16 = 360;
 pub const DISPLAY_HEIGHT: u16 = 360;

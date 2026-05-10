@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 protocol = { path = "../protocol" }
+heapless = "0.8"
 serialport = "4.7"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

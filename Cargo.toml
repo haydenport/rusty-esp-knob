@@ -6,6 +6,10 @@ members = [
     "companion",
 ]
 
+[patch.crates-io]
+esp-hal = { path = "esp-hal-patched" }
+esp-wifi = { path = "esp-wifi-patched" }
+
 [profile.dev]
 opt-level = "s"
 

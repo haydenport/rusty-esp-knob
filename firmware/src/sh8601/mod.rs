@@ -44,6 +44,11 @@ const CHUNK_SIZE: usize = 30_000;
 /// Whole rows per chunk (rounded down so each chunk ends on a row boundary).
 const ROWS_PER_CHUNK: usize = CHUNK_SIZE / ROW_BYTES;
 
+/// DMA-safe copy buffer in internal SRAM. The framebuffer lives in PSRAM;
+/// GDMA on this target cannot reliably source from PSRAM, so each chunk is
+/// copied here before the half_duplex_write call.
+static mut DMA_COPY_BUF: [u8; CHUNK_SIZE] = [0u8; CHUNK_SIZE];
+
 /// Display driver for the Waveshare ESP32-S3 Knob Touch LCD 1.8" QSPI AMOLED.
 ///
 /// Uses an in-memory framebuffer (heap-allocated). All drawing via
@@ -110,16 +115,19 @@ impl<'d> Sh8601<'d> {
 
             self.set_window(0, row, board::DISPLAY_WIDTH - 1, row + rows - 1)?;
 
-            // Write pixel data using quad-mode (opcode 0x32), accessing SPI
-            // and framebuffer as separate fields to satisfy the borrow checker.
+            // Copy to DMA-safe internal SRAM before writing. The framebuffer
+            // is allocated in PSRAM and GDMA cannot reliably source from there.
             let addr = (RAMWR as u32) << 8;
-            self.spi.half_duplex_write(
-                DataMode::Quad,
-                Command::_8Bit(CMD_WRITE_COLOR, DataMode::Single),
-                Address::_24Bit(addr, DataMode::Single),
-                0,
-                &self.framebuffer[offset..offset + bytes],
-            )?;
+            unsafe {
+                DMA_COPY_BUF[..bytes].copy_from_slice(&self.framebuffer[offset..offset + bytes]);
+                self.spi.half_duplex_write(
+                    DataMode::Quad,
+                    Command::_8Bit(CMD_WRITE_COLOR, DataMode::Single),
+                    Address::_24Bit(addr, DataMode::Single),
+                    0,
+                    &DMA_COPY_BUF[..bytes],
+                )?;
+            }
 
             offset += bytes;
             row += rows;
@@ -147,13 +155,16 @@ impl<'d> Sh8601<'d> {
             self.set_window(0, row, board::DISPLAY_WIDTH - 1, row + rows - 1)?;
 
             let addr = (RAMWR as u32) << 8;
-            self.spi.half_duplex_write(
-                DataMode::Quad,
-                Command::_8Bit(CMD_WRITE_COLOR, DataMode::Single),
-                Address::_24Bit(addr, DataMode::Single),
-                0,
-                &self.framebuffer[offset..offset + bytes],
-            )?;
+            unsafe {
+                DMA_COPY_BUF[..bytes].copy_from_slice(&self.framebuffer[offset..offset + bytes]);
+                self.spi.half_duplex_write(
+                    DataMode::Quad,
+                    Command::_8Bit(CMD_WRITE_COLOR, DataMode::Single),
+                    Address::_24Bit(addr, DataMode::Single),
+                    0,
+                    &DMA_COPY_BUF[..bytes],
+                )?;
+            }
 
             row += rows;
         }

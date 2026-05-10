@@ -26,10 +26,25 @@ pub struct Config {
     /// off. 0 disables — the screen stays at the dim level forever.
     #[serde(default = "default_off_after_secs")]
     pub backlight_off_after_secs: u16,
+    /// Transport mode: "usb", "wifi", or "auto" (try WiFi, fall back to USB).
+    #[serde(default = "default_connection_mode")]
+    pub connection_mode: String,
+    /// Device IP saved after successful WiFi provisioning.
+    #[serde(default)]
+    pub wifi_device_ip: String,
+    /// TCP port the device listens on (default 9000).
+    #[serde(default = "default_wifi_port")]
+    pub wifi_port: u16,
 }
 
 fn default_sensitivity() -> u8 {
     2
+}
+fn default_connection_mode() -> String {
+    "usb".to_string()
+}
+fn default_wifi_port() -> u16 {
+    9000
 }
 fn default_backlight_pct() -> u8 {
     100
@@ -50,6 +65,9 @@ impl Default for Config {
             backlight_pct: default_backlight_pct(),
             backlight_dim_after_secs: default_dim_after_secs(),
             backlight_off_after_secs: default_off_after_secs(),
+            connection_mode: default_connection_mode(),
+            wifi_device_ip: String::new(),
+            wifi_port: default_wifi_port(),
         }
     }
 }
@@ -77,6 +95,13 @@ pub fn save(cfg: &Config) {
     if let Ok(s) = toml::to_string_pretty(cfg) {
         let _ = std::fs::write(path, s);
     }
+}
+
+/// Load config, update `wifi_device_ip`, and save.
+pub fn save_wifi_ip(ip: &str) {
+    let mut cfg = load();
+    cfg.wifi_device_ip = ip.to_string();
+    save(&cfg);
 }
 
 /// Scan available serial ports and return the first one with the

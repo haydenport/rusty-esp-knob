@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use heapless::String as HString;
 use protocol::codec::{self, Decoder};
 use protocol::messages::{AppInfo, DeviceToHost, HostToDevice};
 use serialport::ClearBuffer;
@@ -14,6 +17,15 @@ pub enum WorkerStatus {
     Connected(String),
     Disconnected,
     Error(String),
+}
+
+/// Commands sent from the tray thread into the running worker.
+pub enum WorkerCommand {
+    ProvisionWifi {
+        ssid: HString<32>,
+        password: HString<64>,
+        reply: std::sync::mpsc::SyncSender<Result<String, String>>,
+    },
 }
 
 /// Shared backlight settings. The tray writes via the setters; the worker
@@ -45,6 +57,62 @@ impl BacklightShared {
     }
 }
 
+/// Unified transport interface over USB serial and TCP.
+pub trait Transport: Read + Write {
+    fn clear_input(&mut self);
+    fn description(&self) -> String;
+}
+
+impl Transport for Box<dyn serialport::SerialPort> {
+    fn clear_input(&mut self) {
+        let _ = self.clear(ClearBuffer::Input);
+    }
+    fn description(&self) -> String {
+        self.name().unwrap_or_default()
+    }
+}
+
+/// TCP transport wrapping a `TcpStream`.
+pub struct TcpTransport {
+    stream: TcpStream,
+    addr: String,
+}
+
+impl TcpTransport {
+    pub fn connect(addr: &str) -> Result<Self, std::io::Error> {
+        let sock_addr: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5))?;
+        stream.set_read_timeout(Some(Duration::from_millis(50)))?;
+        Ok(Self { stream, addr: addr.to_string() })
+    }
+}
+
+impl Read for TcpTransport {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.read(buf)
+    }
+}
+
+impl Write for TcpTransport {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.stream.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+impl Transport for TcpTransport {
+    fn clear_input(&mut self) {
+        // TCP has no OS-level buffer clear; decoder reset handles recovery.
+    }
+    fn description(&self) -> String {
+        self.addr.clone()
+    }
+}
+
 /// Open `port_name`, run the full init sequence (including Ready handshake),
 /// then loop processing encoder/gesture events until `stop` is set.
 ///
@@ -56,14 +124,203 @@ pub fn run(
     backlight: Arc<BacklightShared>,
     stop: Arc<AtomicBool>,
     status_tx: std::sync::mpsc::Sender<WorkerStatus>,
+    cmd_rx: std::sync::mpsc::Receiver<WorkerCommand>,
 ) {
-    // Initialize COM for this thread. In CLI mode the caller already did this
-    // on the same thread (S_FALSE = already initialized, not an error). In tray
-    // mode the worker runs on a spawned thread that hasn't initialized COM yet.
+    let Some((app_infos, volumes, mutes, icon_map)) =
+        prepare_audio_data(&status_tx) else { return };
+
+    let mut transport: Box<dyn serialport::SerialPort> =
+        match serialport::new(port_name, 115_200)
+            .timeout(Duration::from_secs(2))
+            .open()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("failed to open {port_name}: {e}");
+                let _ = status_tx.send(WorkerStatus::Error(format!("port: {e}")));
+                return;
+            }
+        };
+
+    println!("opened {port_name}");
+    let _ = status_tx.send(WorkerStatus::Connected(port_name.to_string()));
+
+    // Allow USB CDC enumeration to settle before we start talking.
+    std::thread::sleep(Duration::from_millis(200));
+    run_inner(
+        &mut transport,
+        app_infos,
+        volumes,
+        mutes,
+        icon_map,
+        sensitivity,
+        backlight,
+        stop,
+        &cmd_rx,
+    );
+}
+
+/// Connect to the device via TCP and run the same event loop as `run`.
+///
+/// Retries the TCP connection every 3 seconds indefinitely (until `stop` is
+/// set) to handle: companion starting before the device is on, and the device
+/// being power-cycled after an established connection drops.
+pub fn run_wifi(
+    ip: &str,
+    port: u16,
+    sensitivity: Arc<AtomicU8>,
+    backlight: Arc<BacklightShared>,
+    stop: Arc<AtomicBool>,
+    status_tx: std::sync::mpsc::Sender<WorkerStatus>,
+    cmd_rx: std::sync::mpsc::Receiver<WorkerCommand>,
+) {
+    let Some((app_infos, volumes, mutes, icon_map)) =
+        prepare_audio_data(&status_tx) else { return };
+
+    let addr = format!("{ip}:{port}");
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Retry connecting every 3 s until success or stop.
+        let mut transport = loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            match TcpTransport::connect(&addr) {
+                Ok(t) => break t,
+                Err(e) => {
+                    eprintln!("tcp connect to {addr} failed: {e}");
+                    let _ = status_tx.send(WorkerStatus::Error(
+                        "WiFi: connecting…".to_string(),
+                    ));
+                    let wait_until = Instant::now() + Duration::from_secs(3);
+                    while Instant::now() < wait_until {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        };
+
+        println!("connected to {addr}");
+        let _ = status_tx.send(WorkerStatus::Connected(addr.clone()));
+
+        run_inner(
+            &mut transport,
+            app_infos.clone(),
+            volumes.clone(),
+            mutes.clone(),
+            icon_map.clone(),
+            sensitivity.clone(),
+            backlight.clone(),
+            stop.clone(),
+            &cmd_rx,
+        );
+
+        let _ = status_tx.send(WorkerStatus::Disconnected);
+
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+
+        eprintln!("WiFi transport disconnected; reconnecting in 3 s…");
+        let wait_until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < wait_until {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// Send `SetWifiConfig` over USB and wait up to 30 s for the device to
+/// connect and report its IP.  On success, saves the IP to config and
+/// returns it.
+pub fn provision_wifi(
+    port_name: &str,
+    ssid: &str,
+    password: &str,
+) -> Result<String, String> {
+    let ssid_h: HString<32> =
+        ssid.try_into().map_err(|_| "SSID too long (max 32 chars)".to_string())?;
+    let pass_h: HString<64> =
+        password.try_into().map_err(|_| "password too long (max 64 chars)".to_string())?;
+
+    let mut port: Box<dyn serialport::SerialPort> =
+        serialport::new(port_name, 115_200)
+            .timeout(Duration::from_secs(2))
+            .open()
+            .map_err(|e| format!("port: {e}"))?;
+
+    std::thread::sleep(Duration::from_millis(200));
+    let mut decoder = Decoder::new(16 * 1024);
+    let _ = drain_for(&mut port, Duration::from_millis(100), &mut decoder);
+    port.clear_input();
+    decoder = Decoder::new(16 * 1024);
+
+    println!(">>> waiting for Ready...");
+    send(&mut port, &HostToDevice::Ping);
+    wait_for_ready(&mut port, &mut decoder);
+
+    println!(">>> sending SetWifiConfig ssid={ssid}");
+    send(&mut port, &HostToDevice::SetWifiConfig { ssid: ssid_h, password: pass_h });
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut buf = [0u8; 256];
+    while Instant::now() < deadline {
+        match port.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => {
+                let _ = decoder.push(&buf[..n]);
+                loop {
+                    match decoder.next_frame::<DeviceToHost>() {
+                        Ok(Some(DeviceToHost::WifiStatus { connected: true, ip })) => {
+                            crate::config::save_wifi_ip(ip.as_str());
+                            return Ok(ip.to_string());
+                        }
+                        Ok(Some(DeviceToHost::WifiStatus { connected: false, ip }))
+                            if ip == "REBOOT" =>
+                        {
+                            return Err(
+                                "device requires reboot to apply new credentials".to_string(),
+                            );
+                        }
+                        Ok(Some(_)) | Ok(None) => break,
+                        Err(_) => {
+                            decoder.reset();
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(format!("read: {e}")),
+        }
+    }
+    Err("timed out waiting for WiFi connection".to_string())
+}
+
+/// Enumerate audio sessions and build the data structures shared between
+/// `run` and `run_wifi`.  Reports errors via `status_tx` and returns `None`
+/// on failure.
+fn prepare_audio_data(
+    status_tx: &std::sync::mpsc::Sender<WorkerStatus>,
+) -> Option<(
+    Vec<AppInfo>,
+    HashMap<u32, f32>,
+    HashMap<u32, bool>,
+    HashMap<u32, Vec<u8>>,
+)> {
     if let Err(e) = audio::init() {
         eprintln!("COM init failed on worker thread: {e}");
         let _ = status_tx.send(WorkerStatus::Error(format!("COM: {e}")));
-        return;
+        return None;
     }
 
     let sessions = match audio::enumerate() {
@@ -71,18 +328,17 @@ pub fn run(
         Err(e) => {
             eprintln!("audio enumerate failed: {e}");
             let _ = status_tx.send(WorkerStatus::Error(format!("audio: {e}")));
-            return;
+            return None;
         }
     };
 
     let mut app_infos: Vec<AppInfo> = Vec::new();
     let mut volumes: HashMap<u32, f32> = HashMap::new();
     let mut mutes: HashMap<u32, bool> = HashMap::new();
-    let mut icons: HashMap<u32, Vec<u8>> = HashMap::new();
+    let mut icon_map: HashMap<u32, Vec<u8>> = HashMap::new();
     let mut seen_pids: HashSet<u32> = HashSet::new();
 
     for (idx, s) in sessions.iter().enumerate() {
-        // Skip system-sounds (pid 0) and duplicate PIDs (multiple streams per app).
         if s.pid == 0 || !seen_pids.insert(s.pid) {
             continue;
         }
@@ -99,7 +355,7 @@ pub fn run(
             match icons::extract_rgb565(&s.exe_path) {
                 Some(px) => {
                     println!("[{idx}] {} pid={id} ({}B icon)", s.process_name, px.len());
-                    icons.insert(id, px);
+                    icon_map.insert(id, px);
                 }
                 None => println!("[{idx}] {} pid={id} (no icon)", s.process_name),
             }
@@ -111,48 +367,45 @@ pub fn run(
     if app_infos.is_empty() {
         println!("(no pushable audio sessions)");
         let _ = status_tx.send(WorkerStatus::Error("no audio sessions".into()));
-        return;
+        return None;
     }
 
-    let mut port = match serialport::new(port_name, 115_200)
-        .timeout(Duration::from_secs(2))
-        .open()
-    {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("failed to open {port_name}: {e}");
-            let _ = status_tx.send(WorkerStatus::Error(format!("port: {e}")));
-            return;
-        }
-    };
+    Some((app_infos, volumes, mutes, icon_map))
+}
 
-    println!("opened {port_name}");
-    let _ = status_tx.send(WorkerStatus::Connected(port_name.to_string()));
-
-    std::thread::sleep(Duration::from_millis(200));
+/// Ready handshake + init sequence + main event loop.  Shared between USB
+/// and WiFi transports.
+fn run_inner(
+    transport: &mut dyn Transport,
+    app_infos: Vec<AppInfo>,
+    mut volumes: HashMap<u32, f32>,
+    mut mutes: HashMap<u32, bool>,
+    mut icons: HashMap<u32, Vec<u8>>,
+    sensitivity: Arc<AtomicU8>,
+    backlight: Arc<BacklightShared>,
+    stop: Arc<AtomicBool>,
+    cmd_rx: &std::sync::mpsc::Receiver<WorkerCommand>,
+) {
     let mut decoder = Decoder::new(16 * 1024);
-    let _ = drain_for(&mut *port, Duration::from_millis(100), &mut decoder);
-    let _ = port.clear(ClearBuffer::Input);
+    let _ = drain_for(transport, Duration::from_millis(100), &mut decoder);
+    transport.clear_input();
     decoder = Decoder::new(16 * 1024);
 
-    // Ready handshake: send Ping, wait for the firmware's Ready reply.
-    // This guarantees USB CDC is fully up before we blast the init sequence,
-    // eliminating the first-run COBS decode error from stale enumeration bytes.
     println!(">>> waiting for Ready (sending Ping)...");
-    send(&mut *port, &HostToDevice::Ping);
-    wait_for_ready(&mut *port, &mut decoder);
+    send(transport, &HostToDevice::Ping);
+    wait_for_ready(transport, &mut decoder);
 
     let first_id = app_infos[0].id;
     println!(">>> sending SetAppList ({} apps)", app_infos.len());
-    send_and_wait(&mut *port, &mut decoder, &HostToDevice::SetAppList(app_infos.clone()));
+    send_and_wait(transport, &mut decoder, &HostToDevice::SetAppList(app_infos.clone()));
     println!(">>> SetAppList ack'd");
     println!(">>> sending SetSelectedApp({first_id})");
-    send_and_wait(&mut *port, &mut decoder, &HostToDevice::SetSelectedApp(first_id));
+    send_and_wait(transport, &mut decoder, &HostToDevice::SetSelectedApp(first_id));
     println!(">>> SetSelectedApp ack'd");
     for (&app_id, pixels) in &icons {
         println!(">>> sending SetAppIcon(app_id={app_id}, {}B)", pixels.len());
         send_and_wait(
-            &mut *port,
+            transport,
             &mut decoder,
             &HostToDevice::SetAppIcon { app_id, pixels: pixels.clone() },
         );
@@ -163,12 +416,15 @@ pub fn run(
     let mut buf = [0u8; 256];
     let mut last_refresh = Instant::now();
     let mut last_heartbeat = Instant::now();
+    // State for in-band WiFi provisioning (command arrives via cmd_rx).
+    let mut pending_wifi_reply: Option<std::sync::mpsc::SyncSender<Result<String, String>>> = None;
+    let mut wifi_deadline: Option<Instant> = None;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
 
-        match port.read(&mut buf) {
+        match transport.read(&mut buf) {
             Ok(0) => {}
             Ok(n) => {
                 let _ = decoder.push(&buf[..n]);
@@ -183,29 +439,35 @@ pub fn run(
                                     volumes.insert(app_id, new_vol);
                                     let level = (new_vol * 100.0).round() as u8;
                                     println!("vol {app_id} → {level}%");
-                                    send(&mut *port, &HostToDevice::SetVolume { app_id, level });
+                                    send(
+                                        transport,
+                                        &HostToDevice::SetVolume { app_id, level },
+                                    );
                                 }
                                 Err(e) => eprintln!("set_volume({app_id}): {e}"),
                             }
                         }
                         Ok(Some(DeviceToHost::AppSelected(app_id))) => {
                             println!("<<< AppSelected({app_id})");
-                            // Send SetVolume first and wait for Ack — the firmware
-                            // flushes the display after SetVolume, and we must wait
-                            // for that flush to complete before sending the large
-                            // icon frame, otherwise the USB RX FIFO backs up and
-                            // the write fails with ERROR_SEM_TIMEOUT.
                             if let Some(&vol) = volumes.get(&app_id) {
                                 let level = (vol * 100.0).round() as u8;
                                 println!("  → SetVolume({app_id}, {level}%)");
-                                send_and_wait(&mut *port, &mut decoder, &HostToDevice::SetVolume { app_id, level });
+                                send_and_wait(
+                                    transport,
+                                    &mut decoder,
+                                    &HostToDevice::SetVolume { app_id, level },
+                                );
                             } else {
                                 println!("  → no volume entry for pid {app_id}");
                             }
                             if let Some(pixels) = icons.get(&app_id) {
                                 let pixels = pixels.clone();
                                 println!("  → SetAppIcon({app_id}, {}B)", pixels.len());
-                                send_and_wait(&mut *port, &mut decoder, &HostToDevice::SetAppIcon { app_id, pixels });
+                                send_and_wait(
+                                    transport,
+                                    &mut decoder,
+                                    &HostToDevice::SetAppIcon { app_id, pixels },
+                                );
                             } else {
                                 println!("  → no icon for pid {app_id}");
                             }
@@ -218,7 +480,7 @@ pub fn run(
                                     mutes.insert(app_id, new_muted);
                                     println!("mute {app_id} → {new_muted}");
                                     send(
-                                        &mut *port,
+                                        transport,
                                         &HostToDevice::SetMute { app_id, muted: new_muted },
                                     );
                                 }
@@ -227,11 +489,25 @@ pub fn run(
                         }
                         Ok(Some(DeviceToHost::Ack)) => {}
                         Ok(Some(DeviceToHost::Pong)) => {}
+                        Ok(Some(DeviceToHost::WifiStatus { connected, ip })) => {
+                            println!("<<< WifiStatus connected={connected} ip={ip}");
+                            if let Some(reply) = pending_wifi_reply.take() {
+                                wifi_deadline = None;
+                                if connected {
+                                    crate::config::save_wifi_ip(ip.as_str());
+                                    let _ = reply.send(Ok(ip.to_string()));
+                                } else if ip.as_str() == "REBOOT" {
+                                    let _ = reply.send(Err("device requires reboot to apply new WiFi credentials".to_string()));
+                                } else {
+                                    let _ = reply.send(Err("WiFi connection failed".to_string()));
+                                }
+                            }
+                        }
                         Ok(Some(other)) => println!("<<< {other:?}"),
                         Ok(None) => break,
                         Err(e) => {
                             eprintln!("<<< decode error: {e:?}");
-                            let _ = port.clear(ClearBuffer::Input);
+                            transport.clear_input();
                             decoder.reset();
                             break;
                         }
@@ -241,24 +517,39 @@ pub fn run(
             Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => {
                 eprintln!("read error: {e}");
-                let _ = status_tx.send(WorkerStatus::Disconnected);
                 break;
             }
         }
 
-        // Heartbeat: keep the firmware's disconnect timer from firing while connected.
-        if last_heartbeat.elapsed() >= Duration::from_secs(5) {
+        if last_heartbeat.elapsed() >= Duration::from_secs(2) {
             last_heartbeat = Instant::now();
-            send(&mut *port, &HostToDevice::Ping);
+            send(transport, &HostToDevice::Ping);
         }
 
-        // Push backlight settings if the tray changed them (or on first run
-        // after connect, since `dirty` starts true).
         if backlight.dirty.swap(false, Ordering::AcqRel) {
-            send(&mut *port, &backlight.snapshot());
+            send(transport, &backlight.snapshot());
         }
 
-        // Periodically re-enumerate audio sessions so newly-launched apps appear.
+        // Handle commands from the tray thread (e.g. WiFi provisioning).
+        if let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                WorkerCommand::ProvisionWifi { ssid, password, reply } => {
+                    send(transport, &HostToDevice::SetWifiConfig { ssid, password });
+                    pending_wifi_reply = Some(reply);
+                    wifi_deadline = Some(Instant::now() + Duration::from_secs(30));
+                }
+            }
+        }
+        // Time out a pending provision if the device never responded.
+        if let Some(dl) = wifi_deadline {
+            if Instant::now() > dl {
+                if let Some(reply) = pending_wifi_reply.take() {
+                    let _ = reply.send(Err("timed out waiting for WiFi connection".to_string()));
+                }
+                wifi_deadline = None;
+            }
+        }
+
         if last_refresh.elapsed() >= Duration::from_secs(5) {
             last_refresh = Instant::now();
             if let Ok(new_sessions) = audio::enumerate() {
@@ -280,9 +571,12 @@ pub fn run(
                 let new_pids: HashSet<u32> = new_app_infos.iter().map(|a| a.id).collect();
 
                 if old_pids != new_pids {
-                    println!("sessions updated: {} → {} apps", app_infos.len(), new_app_infos.len());
+                    println!(
+                        "sessions updated: {} → {} apps",
+                        app_infos.len(),
+                        new_app_infos.len()
+                    );
 
-                    // Extract icons for any brand-new apps, update volumes/mutes for all.
                     for s in &new_sessions {
                         if s.pid == 0 || !new_pids.contains(&s.pid) {
                             continue;
@@ -291,14 +585,16 @@ pub fn run(
                         mutes.insert(s.pid, s.muted);
                         if !icons.contains_key(&s.pid) && !s.exe_path.is_empty() {
                             if let Some(px) = icons::extract_rgb565(&s.exe_path) {
-                                println!("  extracted icon for {} pid={}", s.process_name, s.pid);
+                                println!(
+                                    "  extracted icon for {} pid={}",
+                                    s.process_name, s.pid
+                                );
                                 icons.insert(s.pid, px);
                             }
                         }
                     }
 
-                    app_infos = new_app_infos.clone();
-                    send(&mut *port, &HostToDevice::SetAppList(new_app_infos));
+                    send(transport, &HostToDevice::SetAppList(new_app_infos));
                 }
             }
         }
@@ -306,14 +602,11 @@ pub fn run(
 }
 
 /// Send Ping and block until `DeviceToHost::Ready` or `Pong` arrives (or 3 s timeout).
-/// Either message confirms the channel is clean. Any earlier decode errors are stale
-/// bytes left in the FIFO from USB re-enumeration; they're discarded automatically
-/// because we called `port.clear` + `decoder.reset` before sending the Ping.
-fn wait_for_ready(port: &mut dyn serialport::SerialPort, decoder: &mut Decoder) {
+fn wait_for_ready(transport: &mut dyn Transport, decoder: &mut Decoder) {
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut buf = [0u8; 256];
     while Instant::now() < deadline {
-        match port.read(&mut buf) {
+        match transport.read(&mut buf) {
             Ok(n) if n > 0 => {
                 let _ = decoder.push(&buf[..n]);
                 loop {
@@ -342,15 +635,15 @@ fn wait_for_ready(port: &mut dyn serialport::SerialPort, decoder: &mut Decoder) 
 }
 
 pub fn send_and_wait(
-    port: &mut dyn serialport::SerialPort,
+    transport: &mut dyn Transport,
     decoder: &mut Decoder,
     msg: &HostToDevice,
 ) {
-    send(port, msg);
+    send(transport, msg);
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut buf = [0u8; 256];
     while Instant::now() < deadline {
-        match port.read(&mut buf) {
+        match transport.read(&mut buf) {
             Ok(0) => {}
             Ok(n) => {
                 let _ = decoder.push(&buf[..n]);
@@ -361,7 +654,7 @@ pub fn send_and_wait(
                         Ok(None) => break,
                         Err(e) => {
                             eprintln!("<<< decode error: {e:?}");
-                            let _ = port.clear(ClearBuffer::Input);
+                            transport.clear_input();
                             decoder.reset();
                             break;
                         }
@@ -378,7 +671,7 @@ pub fn send_and_wait(
     eprintln!("!!! timed out waiting for Ack");
 }
 
-pub fn send(port: &mut dyn serialport::SerialPort, msg: &HostToDevice) {
+pub fn send(transport: &mut dyn Transport, msg: &HostToDevice) {
     let bytes = match codec::encode(msg) {
         Ok(b) => b,
         Err(e) => {
@@ -386,13 +679,13 @@ pub fn send(port: &mut dyn serialport::SerialPort, msg: &HostToDevice) {
             return;
         }
     };
-    if let Err(e) = port.write_all(&bytes) {
+    if let Err(e) = transport.write_all(&bytes) {
         eprintln!("write error: {e}");
     }
 }
 
 pub fn drain_for(
-    port: &mut dyn serialport::SerialPort,
+    transport: &mut dyn Transport,
     duration: Duration,
     decoder: &mut Decoder,
 ) -> usize {
@@ -400,7 +693,7 @@ pub fn drain_for(
     let mut buf = [0u8; 256];
     let mut total = 0;
     while Instant::now() < deadline {
-        match port.read(&mut buf) {
+        match transport.read(&mut buf) {
             Ok(0) => {}
             Ok(n) => {
                 total += n;
